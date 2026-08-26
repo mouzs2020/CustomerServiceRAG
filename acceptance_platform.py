@@ -135,6 +135,43 @@ CASES = [
         "blocked_multiple_platforms",
         None,
     ),
+    # ---- 反例：泛化词（条件/流程/规则）不构成“售后相关” ----
+    (
+        "M 问招聘流程",
+        "aliexpress",
+        "招聘流程是什么",
+        "blocked_unrelated_question",
+        None,
+    ),
+    (
+        "N 问足球比赛规则",
+        "temu",
+        "足球比赛规则是什么",
+        "blocked_unrelated_question",
+        None,
+    ),
+    (
+        "O 问 Python 运行条件",
+        "aliexpress",
+        "Python运行条件是什么",
+        "blocked_unrelated_question",
+        None,
+    ),
+    # ---- 正例：领域词 + 泛化词组合仍然通过 ----
+    (
+        "P 问退款流程",
+        "aliexpress",
+        "退款流程是什么",
+        "platform_resolved",
+        "aliexpress",
+    ),
+    (
+        "Q 问退货条件",
+        "temu",
+        "退货条件是什么",
+        "platform_resolved",
+        "temu",
+    ),
 ]
 
 

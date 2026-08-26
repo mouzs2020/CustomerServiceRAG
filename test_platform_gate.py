@@ -57,6 +57,32 @@ class ResolvePlatformTests(unittest.TestCase):
         result = resolve_platform("退款规则", "   ")
         self.assertEqual(result["status"], "blocked_missing_platform")
 
+    def test_generic_words_alone_are_not_store_related(self):
+        # “条件 / 流程 / 规则”等泛化词不能单独触发售后相关。
+        cases = [
+            ("招聘流程是什么", "aliexpress", "blocked_unrelated_question"),
+            ("足球比赛规则是什么", "temu", "blocked_unrelated_question"),
+            ("Python运行条件是什么", "aliexpress", "blocked_unrelated_question"),
+        ]
+        for query, entry, expected in cases:
+            with self.subTest(query=query, entry=entry):
+                self.assertEqual(
+                    resolve_platform(query, entry)["status"], expected
+                )
+
+    def test_domain_word_with_generic_word_still_resolved(self):
+        # 领域词（退款 / 退货）+ 泛化词组合仍然通过门控。
+        cases = [
+            ("退款流程是什么", "aliexpress", "aliexpress"),
+            ("退货条件是什么", "temu", "temu"),
+            ("速卖通退款规则", "", "aliexpress"),
+        ]
+        for query, entry, expected_platform in cases:
+            with self.subTest(query=query, entry=entry or "<empty>"):
+                result = resolve_platform(query, entry)
+                self.assertEqual(result["status"], "platform_resolved")
+                self.assertEqual(result["requested_platform"], expected_platform)
+
     def test_acceptance_cases_still_pass(self):
         for name, user_platform, query, expected_status, expected_platform in CASES:
             with self.subTest(case=name):
@@ -93,6 +119,18 @@ class RetrieveNotCalledOnBlockedTests(unittest.TestCase):
             ["Temu退款规则", "--user-platform", "aliexpress"],
             "blocked_platform_conflict",
         ),
+        (
+            ["招聘流程是什么", "--user-platform", "aliexpress"],
+            "blocked_unrelated_question",
+        ),
+        (
+            ["足球比赛规则是什么", "--user-platform", "temu"],
+            "blocked_unrelated_question",
+        ),
+        (
+            ["Python运行条件是什么", "--user-platform", "aliexpress"],
+            "blocked_unrelated_question",
+        ),
     ]
 
     def run_main(self, argv):
@@ -117,13 +155,18 @@ class RetrieveNotCalledOnBlockedTests(unittest.TestCase):
                 self.assertEqual(bundle["status"], expected_status)
                 self.assertEqual(bundle["evidence"], [])
 
-    def test_resolved_status_calls_retrieve(self):
-        # 对照：platform_resolved 时 retrieve_and_rank 必须被调用，
+    def test_resolved_statuses_call_retrieve(self):
+        # 对照：platform_resolved 时必须调用 retrieve_and_rank，
         # 证明测试不是“永远不调用”。
-        retrieve_mock, _ = self.run_main(
-            ["退款规则", "--user-platform", "aliexpress"]
-        )
-        retrieve_mock.assert_called_once()
+        resolved_cases = [
+            ["退款规则", "--user-platform", "aliexpress"],
+            ["退款流程是什么", "--user-platform", "aliexpress"],
+            ["退货条件是什么", "--user-platform", "temu"],
+        ]
+        for argv in resolved_cases:
+            with self.subTest(argv=argv):
+                retrieve_mock, _ = self.run_main(argv)
+                retrieve_mock.assert_called_once()
 
 
 if __name__ == "__main__":
