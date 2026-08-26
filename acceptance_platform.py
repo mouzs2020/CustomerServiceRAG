@@ -54,6 +54,35 @@ CASES = [
         "blocked_unrelated_question",
         None,
     ),
+    # ---- 反例：平台名只识别平台，不构成“售后相关” ----
+    (
+        "G 进入速卖通，闲聊问模型",
+        "aliexpress",
+        "你是什么模型",
+        "blocked_unrelated_question",
+        None,
+    ),
+    (
+        "H 进入 Temu，问天气",
+        "temu",
+        "今天天气怎么样",
+        "blocked_unrelated_question",
+        None,
+    ),
+    (
+        "I 问题带 Temu 但无关售后",
+        "",
+        "Temu是什么模型",
+        "blocked_unrelated_question",
+        None,
+    ),
+    (
+        "J 问题带速卖通但无关售后",
+        "",
+        "速卖通老板是谁",
+        "blocked_unrelated_question",
+        None,
+    ),
     # ---- Temu 反向 ----
     (
         "A' 能读到 Temu，问退款规则",
@@ -89,6 +118,22 @@ CASES = [
         "Temu退款规则",
         "platform_resolved",
         "temu",
+    ),
+    # ---- 非法进入平台 ----
+    (
+        "K 非法进入平台",
+        "suning",
+        "退款规则",
+        "blocked_invalid_entry_platform",
+        None,
+    ),
+    # ---- 多平台 ----
+    (
+        "L 同时问两个平台",
+        "",
+        "速卖通和Temu的退款规则一样吗",
+        "blocked_multiple_platforms",
+        None,
     ),
 ]
 

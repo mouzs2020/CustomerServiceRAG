@@ -14,6 +14,9 @@ FEATURE_PLATFORM_ENTRY_DETECTION = True
 ALIEXPRESS_NAMES = {"速卖通", "aliexpress"}
 TEMU_NAMES = {"temu"}
 
+# 仅用于判断问题是否属于“退款 / 售后”领域。
+# 平台名称（速卖通 / Temu / aliexpress）只用于识别平台，
+# 不能单独作为“退款售后相关”的依据。
 STORE_DOMAIN_KEYWORDS = (
     "退款",
     "退货",
@@ -31,9 +34,6 @@ STORE_DOMAIN_KEYWORDS = (
     "运费",
     "发货",
     "质检",
-    "速卖通",
-    "temu",
-    "aliexpress",
 )
 
 UNRELATED_FALLBACK = (
@@ -80,18 +80,33 @@ def resolve_platform(
 ) -> dict[str, object]:
     """合并“进入平台参数”与“问题平台关键字”，返回平台门控结果。
 
-    新规则优先级：
+    规则优先级：
+    0. 非空非法进入平台 -> ``blocked_invalid_entry_platform``。
     1. 只提供参数 -> 以参数为准。
     2. 只在问题中写平台 -> 使用问题中的平台。
     3. 两边相同 -> 正常召回。
     4. 两边冲突 -> ``blocked_platform_conflict``。
     5. 两边都没有 -> ``blocked_missing_platform``。
-    7. 与店铺平台无关的问题 -> ``blocked_unrelated_question``。
+    6. 与店铺平台无关的问题 -> ``blocked_unrelated_question``。
+
+    注意：平台名称只用于识别平台，不能单独作为“退款售后相关”的依据。
     """
     if not FEATURE_PLATFORM_ENTRY_DETECTION:
         user_platform = None
 
-    entry_platform = normalize_platform(user_platform)
+    # 非空但非法的进入平台：直接拦截，不得退化为问题识别。
+    if user_platform is not None and user_platform.strip():
+        entry_platform = normalize_platform(user_platform)
+        if entry_platform is None:
+            return {
+                "status": "blocked_invalid_entry_platform",
+                "reason": "Invalid entry platform",
+                "requested_platform": None,
+                "entry_platform": None,
+            }
+    else:
+        entry_platform = None
+
     question_platforms = detect_platforms_in_query(query)
 
     if not is_store_related(query):
