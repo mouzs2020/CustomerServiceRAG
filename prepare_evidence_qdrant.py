@@ -1,19 +1,14 @@
-from qdrant_client import QdrantClient, models
+import argparse
 import json
-import sys
 from pathlib import Path
 
+from platform_gate import resolve_platform
 
-from sentence_transformers import SentenceTransformer
-import torch
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-)
 
 QDRANT_PATH = "output/qdrant_storage"
 COLLECTION_NAME = "rag_rules_bge_small_zh_v1_5"
 MANIFEST_PATH = Path("output/embedding_manifest.json")
+OUTPUT_PATH = Path("output/evidence_bundle_qdrant.json")
 
 QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 TOP_K = 5
@@ -22,151 +17,148 @@ RERANKER_ID = "BAAI/bge-reranker-base"
 TOP_K_RERANK = 3
 
 
-if len(sys.argv) < 2:
-    raise SystemExit(
-        'Usage: python retrieve_numpy.py "你的问题"'
-    )
-
-query = " ".join(sys.argv[1:])
-
-query_lower = query.lower()
-detected_platforms = set()
-
-if "速卖通" in query or "aliexpress" in query_lower:
-    detected_platforms.add("aliexpress")
-if "temu" in query_lower:
-    detected_platforms.add("temu")
-
-if len(detected_platforms) != 1:
-    status = (
-        "blocked_missing_platform"
-        if not detected_platforms
-        else "blocked_multiple_platforms"
-    )
-    bundle = {
+def build_blocked_bundle(query: str, gate: dict[str, object]) -> dict[str, object]:
+    return {
         "query": query,
-        "status": status,
-        "reason": "Query must specify exactly one platform",
-        "requested_platform": None,
+        "status": gate["status"],
+        "reason": gate["reason"],
+        "requested_platform": gate["requested_platform"],
+        "entry_platform": gate["entry_platform"],
         "evidence": [],
     }
-    output_path = Path("output/evidence_bundle_qdrant.json")
-    output_path.write_text(
-        json.dumps(bundle, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+
+
+def retrieve_and_rank(
+    query: str,
+    requested_platform: str,
+) -> list[dict[str, object]]:
+    """粗筛（Qdrant 平台过滤检索） + 重排。
+
+    只有平台门控通过后才会被调用，因此冲突 / 缺失 / 无关的场景
+    不会加载 Embedding 模型，也不会访问 Qdrant 或 Reranker。
+    """
+    import torch
+    from qdrant_client import QdrantClient, models
+    from sentence_transformers import SentenceTransformer
+    from transformers import (
+        AutoModelForSequenceClassification,
+        AutoTokenizer,
     )
-    print(json.dumps(bundle, ensure_ascii=False, indent=2))
-    raise SystemExit(0)
 
-requested_platform = detected_platforms.pop()
-manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
 
-model = SentenceTransformer(manifest["model_id"], device="cpu")
-query_embedding = model.encode(
-    [QUERY_PREFIX + query],
-    convert_to_numpy=True,
-    normalize_embeddings=True,
-)[0]
+    model = SentenceTransformer(manifest["model_id"], device="cpu")
+    query_embedding = model.encode(
+        [QUERY_PREFIX + query],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )[0]
 
-client = QdrantClient(path=QDRANT_PATH)
-points = client.query_points(
-    collection_name=COLLECTION_NAME,
-    query=query_embedding.tolist(),
-    query_filter=models.Filter(
-        must=[
-            models.FieldCondition(
-                key="platform",
-                match=models.MatchValue(value=requested_platform),
-            )
-        ]
-    ),
-    limit=TOP_K,
-    with_payload=True,
-    with_vectors=False,
-).points
-client.close()
+    client = QdrantClient(path=QDRANT_PATH)
+    points = client.query_points(
+        collection_name=COLLECTION_NAME,
+        query=query_embedding.tolist(),
+        query_filter=models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="platform",
+                    match=models.MatchValue(value=requested_platform),
+                )
+            ]
+        ),
+        limit=TOP_K,
+        with_payload=True,
+        with_vectors=False,
+    ).points
+    client.close()
 
-candidates = [
-    {
-        "record": point.payload,
-        "retrieve_rank": rank,
-        "retrieve_score": float(point.score),
-    }
-    for rank, point in enumerate(points, start=1)
-]
+    candidates = [
+        {
+            "record": point.payload,
+            "retrieve_rank": rank,
+            "retrieve_score": float(point.score),
+        }
+        for rank, point in enumerate(points, start=1)
+    ]
 
-if any(
-    item["record"]["platform"] != requested_platform
-    for item in candidates
-):
-    raise RuntimeError("Qdrant platform filter was violated")
+    if any(
+        item["record"]["platform"] != requested_platform
+        for item in candidates
+    ):
+        raise RuntimeError("Qdrant platform filter was violated")
 
-rerank_tokenizer = AutoTokenizer.from_pretrained(
-    RERANKER_ID
-)
-reranker = AutoModelForSequenceClassification.from_pretrained(
-    RERANKER_ID
-)
-reranker.eval()
+    rerank_tokenizer = AutoTokenizer.from_pretrained(RERANKER_ID)
+    reranker = AutoModelForSequenceClassification.from_pretrained(RERANKER_ID)
+    reranker.eval()
 
-pairs = [
-    [query, item["record"]["contextualized_text"]]
-    for item in candidates
-]
+    pairs = [
+        [query, item["record"]["contextualized_text"]]
+        for item in candidates
+    ]
+    inputs = rerank_tokenizer(
+        pairs,
+        padding=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt",
+    )
 
-inputs = rerank_tokenizer(
-    pairs,
-    padding=True,
-    truncation=True,
-    max_length=512,
-    return_tensors="pt",
-)
+    with torch.inference_mode():
+        rerank_scores = reranker(
+            **inputs,
+            return_dict=True,
+        ).logits.view(-1).float().tolist()
 
-with torch.inference_mode():
-    rerank_scores = reranker(
-        **inputs,
-        return_dict=True,
-    ).logits.view(-1).float().tolist()
+    for item, rerank_score in zip(candidates, rerank_scores):
+        item["rerank_score"] = rerank_score
 
-for item, rerank_score in zip(
-    candidates,
-    rerank_scores,
-):
-    item["rerank_score"] = rerank_score
+    return sorted(
+        candidates,
+        key=lambda item: item["rerank_score"],
+        reverse=True,
+    )
 
-all_reranked = sorted(
-    candidates,
-    key=lambda item: item["rerank_score"],
-    reverse=True,
-)
 
-query_lower = query.lower()
-detected_platforms = set()
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Prepare the evidence bundle for the platform-gated RAG pipeline."
+        )
+    )
+    parser.add_argument(
+        "query",
+        nargs="+",
+        help="User question.",
+    )
+    parser.add_argument(
+        "--user-platform",
+        default="",
+        help=(
+            "Platform the user entered from (aliexpress or temu). "
+            "Simulates the platform API in production."
+        ),
+    )
+    args = parser.parse_args()
 
-if "速卖通" in query or "aliexpress" in query_lower:
-    detected_platforms.add("aliexpress")
+    query = " ".join(args.query)
+    gate = resolve_platform(query, args.user_platform)
 
-if "temu" in query_lower:
-    detected_platforms.add("temu")
+    if gate["status"] != "platform_resolved":
+        bundle = build_blocked_bundle(query, gate)
+        OUTPUT_PATH.write_text(
+            json.dumps(bundle, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(json.dumps(bundle, ensure_ascii=False, indent=2))
+        return
 
-if not detected_platforms:
-    status = "blocked_missing_platform"
-    reason = "Query does not specify a platform"
-    requested_platform = None
-    eligible = []
+    requested_platform = gate["requested_platform"]
+    all_reranked = retrieve_and_rank(query, requested_platform)
 
-elif len(detected_platforms) > 1:
-    status = "blocked_multiple_platforms"
-    reason = "Query mentions multiple platforms"
-    requested_platform = None
-    eligible = []
-
-else:
-    requested_platform = detected_platforms.pop()
     eligible = [
-        item for item in all_reranked
-        if item["record"]["platform"]
-        == requested_platform
+        item
+        for item in all_reranked
+        if item["record"]["platform"] == requested_platform
     ][:TOP_K_RERANK]
 
     if eligible:
@@ -179,36 +171,37 @@ else:
         status = "blocked_no_matching_source"
         reason = "No candidate matches the requested platform"
 
-evidence = []
+    evidence = []
+    for index, item in enumerate(eligible, start=1):
+        record = item["record"]
+        evidence.append(
+            {
+                "citation_id": f"E{index}",
+                "chunk_id": record["chunk_id"],
+                "source_id": record["source_id"],
+                "platform": record["platform"],
+                "headings": record["headings"],
+                "text": record["text"],
+                "retrieve_score": item["retrieve_score"],
+                "rerank_score": item["rerank_score"],
+            }
+        )
 
-for index, item in enumerate(eligible, start=1):
-    record = item["record"]
+    bundle = {
+        "query": query,
+        "status": status,
+        "reason": reason,
+        "requested_platform": requested_platform,
+        "entry_platform": gate["entry_platform"],
+        "evidence": evidence,
+    }
 
-    evidence.append(
-        {
-            "citation_id": f"E{index}",
-            "chunk_id": record["chunk_id"],
-            "source_id": record["source_id"],
-            "platform": record["platform"],
-            "headings": record["headings"],
-            "text": record["text"],
-            "retrieve_score": item["retrieve_score"],
-            "rerank_score": item["rerank_score"],
-        }
+    OUTPUT_PATH.write_text(
+        json.dumps(bundle, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
+    print(json.dumps(bundle, ensure_ascii=False, indent=2))
 
-bundle = {
-    "query": query,
-    "status": status,
-    "reason": reason,
-    "requested_platform": requested_platform,
-    "evidence": evidence,
-}
 
-output_path = Path("output/evidence_bundle_qdrant.json")
-output_path.write_text(
-    json.dumps(bundle, ensure_ascii=False, indent=2),
-    encoding="utf-8",
-)
-
-print(json.dumps(bundle, ensure_ascii=False, indent=2))
+if __name__ == "__main__":
+    main()

@@ -5,6 +5,8 @@ from pathlib import Path
 
 import httpx
 
+from platform_gate import UNRELATED_FALLBACK
+
 
 BUNDLE_PATH = Path("output/evidence_bundle_qdrant.json")
 OUTPUT_PATH = Path("output/answer_qdrant.json")
@@ -13,6 +15,25 @@ FALLBACK = "证据不足，无法根据现有资料回答。"
 bundle = json.loads(
     BUNDLE_PATH.read_text(encoding="utf-8")
 )
+
+if bundle["status"] == "blocked_unrelated_question":
+    answer = UNRELATED_FALLBACK
+    result = {
+        "model": "fallback",
+        "query": bundle["query"],
+        "answer": answer,
+        "used_citations": [],
+    }
+
+    OUTPUT_PATH.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print(answer)
+    print("\nused_citations: []")
+    print(f"saved: {OUTPUT_PATH}")
+    raise SystemExit(0)
 
 if bundle["status"] != "ready_for_grounding":
     raise SystemExit(
