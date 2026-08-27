@@ -4,11 +4,16 @@
     python test_p0_checklist.py                 # 输出六列报告表
     python -m unittest test_p0_checklist -v     # 纳入常规测试发现
 
-层级约定：
+层级与开关约定：
 - unit / unit+mock           —— 确定性逻辑或仅 Mock 底层库；
-- integration-online         —— 真实 DeepSeek API，缺 DEEPSEEK_API_KEY 时 SKIPPED；
-- integration-heavy          —— 真实 Embedding/Qdrant 检索冒烟，
+- integration-online         —— 真实 DeepSeek 分类。必须同时满足：
+                                RAG_P0_ONLINE=1 且进程环境已有
+                                DEEPSEEK_API_KEY，缺任一条件即 SKIPPED。
+                                本文件绝不自动读取本地密钥文件，
+                                也绝不写入进程环境变量。
+- integration-heavy          —— 真实 Embedding+Reranker+Qdrant 完整端到端检索。
                                 默认 SKIPPED，设置 RAG_P0_HEAVY=1 才执行。
+- data-integration           —— 离线索引产物一致性检查；产物缺失即 SKIPPED。
 
 每个案例固定输出：测试 ID、测试层级、输入、预期结果、实际结果、是否通过。
 本文件只新增测试与测试数据，不修改任何生产逻辑。
@@ -17,15 +22,21 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import io
 import json
+import math
 import os
 import re
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, Callable
 from unittest import mock
 
+import httpx
 import numpy as np
 
 import intent_classifier
@@ -38,6 +49,8 @@ from platform_gate import UNRELATED_FALLBACK, UNCERTAIN_FALLBACK
 PROJECT_DIR = Path(__file__).resolve().parent
 FIXTURE_PATH = PROJECT_DIR / "tests" / "fixtures" / "p0_candidates.json"
 ANSWER_SOURCE_PATH = PROJECT_DIR / "answer_with_citations_qdrant.py"
+ANSWER_SOURCE_TEXT = ANSWER_SOURCE_PATH.read_text(encoding="utf-8")
+INDEX_DIR = PROJECT_DIR / "output"
 
 _FIXTURE_RAW = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 FIXTURE_CANDIDATES = _FIXTURE_RAW["candidates"]
@@ -57,7 +70,7 @@ GOOD_INTENT_RESULT = {
 
 
 # --------------------------------------------------------------------------
-# 工具函数
+# 基础工具：平台门控 / Evidence Gate / 路由 / 真实检索边界
 # --------------------------------------------------------------------------
 
 
@@ -98,10 +111,7 @@ def run_evidence(
 
 
 def run_routing_bundle_status(argv: list[str], **kwargs) -> str:
-    """经 peq.main() 验证门控→意图分类→证据门路由。
-
-    检索与写盘 Mock，输出 "{bundle_status}|retrieve_called={bool}"。
-    """
+    """经 peq.main() 验证门控→意图分类→证据门路由；检索与写盘 Mock。"""
     full_argv = ["prepare_evidence_qdrant.py", *argv]
     env = {"MIN_RERANK_SCORE": "0.75"}
     if kwargs.get("threshold_env") is not None:
@@ -190,24 +200,25 @@ def run_real_boundary(
     )
 
 
-def _ensure_online_api_key() -> bool:
-    """优先会话环境变量；否则尝试本地 deepseek_api.env（值不打印）。"""
-    if os.environ.get("DEEPSEEK_API_KEY"):
-        return True
-    local_env = PROJECT_DIR / "deepseek_api.env"
-    if local_env.exists():
-        pattern = re.compile(r"^\s*DEEPSEEK_API_KEY\s*=\s*(\S.+?)\s*$")
-        for line in local_env.read_text(encoding="utf-8").splitlines():
-            matched = pattern.match(line)
-            if matched and not matched.group(1).startswith("#"):
-                os.environ["DEEPSEEK_API_KEY"] = matched.group(1)
-                return True
-    return False
+# --------------------------------------------------------------------------
+# integration-online：真实 DeepSeek 分类（双条件显式开启）
+# --------------------------------------------------------------------------
+
+
+def _online_mode_enabled() -> bool:
+    """在线测试必须显式双条件开启：RAG_P0_ONLINE=1 且环境已有 Key。
+
+    本函数绝不读取本地密钥文件，也绝不写入进程环境变量。
+    """
+    return (
+        os.environ.get("RAG_P0_ONLINE") == "1"
+        and bool(os.environ.get("DEEPSEEK_API_KEY"))
+    )
 
 
 def run_online_classify(query: str) -> str:
     """真实调用 DeepSeek 分类器，再经 decide_after_intent 映射生产结果。"""
-    if not _ensure_online_api_key():
+    if not os.environ.get("DEEPSEEK_API_KEY"):
         return "SKIPPED: DEEPSEEK_API_KEY not available"
     result = intent_classifier.classify_intent(query)
     decision_status, _reason = peq.decide_after_intent(result)
@@ -215,51 +226,269 @@ def run_online_classify(query: str) -> str:
     return f"intent={result['intent']}|final={final_status}"
 
 
-def run_heavy_retrieval() -> str:
-    """真实 Embedding + Qdrant 冒烟（不加载 Reranker，避免重载）。"""
+# --------------------------------------------------------------------------
+# integration-heavy：真实 Embedding+Reranker+Qdrant 完整端到端检索
+# --------------------------------------------------------------------------
+
+
+HEAVY_ALLOWED_GATES = {
+    "ready_for_grounding",
+    "blocked_low_relevance",
+    "blocked_no_matching_source",
+    "blocked_platform_evidence_mismatch",
+    "blocked_invalid_evidence",
+}
+
+
+def run_heavy_e2e(platform: str) -> str:
+    """加载全部真实模型的完整检索链路 + 生产 Evidence Gate 判定。"""
     try:
-        manifest = json.loads(peq.MANIFEST_PATH.read_text(encoding="utf-8"))
-        from sentence_transformers import SentenceTransformer
-
-        model = SentenceTransformer(manifest["model_id"], device="cpu")
-        vector = model.encode(
-            [peq.QUERY_PREFIX + "退款流程是什么"],
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )[0]
-        from qdrant_client import QdrantClient
-
-        client = QdrantClient(path=peq.QDRANT_PATH)
-        points = client.query_points(
-            collection_name=peq.COLLECTION_NAME,
-            query=vector.tolist(),
-            limit=peq.TOP_K,
-            with_payload=True,
-            with_vectors=False,
-        ).points
-        client.close()
-        platforms = sorted({str(p.payload.get("platform")) for p in points})
-        return f"points={len(points)}|platforms={platforms}"
-    except Exception as exc:  # noqa: BLE001 —— 冒烟环境不可用时如实上报
+        candidates = peq.retrieve_and_rank("退款流程是什么", platform)
+    except Exception as exc:  # noqa: BLE001 —— 模型/存储不可用时如实上报
         return f"SKIP:{type(exc).__name__}: {exc}"[:120]
 
+    with mock.patch.dict(os.environ, {"MIN_RERANK_SCORE": "0.75"}):
+        gate_status, _reason, evidence, _gate_info = peq.evaluate_evidence(
+            platform, candidates
+        )
 
-def heavy_smoke_ok(actual: str) -> bool:
+    platforms = sorted({item["record"]["platform"] for item in candidates})
+    rerank_finite = all(
+        isinstance(item["rerank_score"], (int, float))
+        and math.isfinite(float(item["rerank_score"]))
+        for item in candidates
+    )
+    return (
+        f"gate_status={gate_status}|candidates={len(candidates)}"
+        f"|evidence={len(evidence)}|platforms={platforms}"
+        f"|rerank_finite={rerank_finite}"
+    )
+
+
+def heavy_e2e_ok(actual: str, platform: str) -> bool:
+    """平台严格相等——任何跨平台污染都会判 FAIL。"""
     if actual.startswith("SKIP") or "<error>" in actual:
         return False
-    match = re.match(r"^points=(\d+)\|platforms=(\[.*\])$", actual)
+    match = re.match(
+        r"^gate_status=(\S+)\|candidates=(\d+)\|evidence=(\d+)\|platforms=",
+        actual,
+    )
     if not match:
         return False
-    count = int(match.group(1))
-    platforms_list = eval(match.group(2))  # noqa: S307 —— 受控测试字符串
-    return count >= 1 and set(platforms_list) <= {"aliexpress", "temu"}
+    platforms_part = actual.split("|platforms=")[1].split("|")[0]
+    return (
+        match.group(1) in HEAVY_ALLOWED_GATES
+        and int(match.group(2)) <= peq.TOP_K          # 检索候选池上限
+        and int(match.group(3)) <= peq.TOP_K_RERANK   # Gate 证据截断上限
+        and platforms_part == repr([platform])
+        and actual.endswith("rerank_finite=True")
+    )
+
+
+# --------------------------------------------------------------------------
+# 回答脚本真实执行：exec 整个生产脚本，仅拦截 httpx.post（DeepSeek 边界）
+# --------------------------------------------------------------------------
+
+
+def make_bundle(status: str, n_evidence: int = 2) -> dict:
+    """构造回答脚本所需的证据包输入（基于 fixtures 候选）。"""
+    sources = ["fx-a-hi", "fx-a-lo"][:n_evidence]
+    evidence = []
+    for index, chunk_id in enumerate(sources):
+        item = base_candidate(chunk_id)
+        evidence.append(
+            {
+                "citation_id": f"E{index + 1}",
+                "chunk_id": item["record"]["chunk_id"],
+                "source_id": item["record"]["source_id"],
+                "platform": item["record"]["platform"],
+                "headings": item["record"]["headings"],
+                "text": item["record"]["text"],
+                "retrieve_score": item["retrieve_score"],
+                "rerank_score": item["rerank_score"],
+            }
+        )
+    return {"status": status, "query": "退款流程是什么", "evidence": evidence}
+
+
+def fake_deepseek_response(
+    status_code: int = 200,
+    payload: dict | None = None,
+    text: str = "upstream error body",
+) -> mock.Mock:
+    response = mock.Mock()
+    response.status_code = status_code
+    response.text = text
+    response.is_error = status_code >= 400
+    if not response.is_error:
+        response.json.return_value = payload
+    return response
+
+
+def chat_payload(content: str) -> dict:
+    return {"choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
+def run_answer_case(
+    bundle: dict,
+    *,
+    api_key: str | None = "dummy-local-test-key",
+    post_return: mock.Mock | None = None,
+    post_side_effect: Exception | None = None,
+) -> str:
+    """在临时目录中 exec 整个回答生产脚本；唯一 Mock 是 httpx.post。
+
+    返回契约字符串："outcome|friendly_model=?|used=?|saved=?|called=?"。
+    """
+    saved_cwd = Path.cwd()
+    outcome = "completed"
+    called = "False"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "output"
+            out_dir.mkdir()
+            (out_dir / "evidence_bundle_qdrant.json").write_text(
+                json.dumps(bundle, ensure_ascii=False), encoding="utf-8"
+            )
+            os.chdir(out_dir.parent)
+            try:
+                with mock.patch.dict(os.environ):
+                    if api_key is None:
+                        os.environ.pop("DEEPSEEK_API_KEY", None)
+                    else:
+                        os.environ["DEEPSEEK_API_KEY"] = api_key
+                    with mock.patch.object(
+                        httpx,
+                        "post",
+                        return_value=post_return,
+                        side_effect=post_side_effect,
+                    ) as post_mock:
+                        buffer = io.StringIO()
+                        namespace: dict[str, Any] = {
+                            "__name__": "answer_with_citations_qdrant_under_test",
+                            "__file__": str(ANSWER_SOURCE_PATH),
+                        }
+                        with redirect_stdout(buffer):
+                            try:
+                                exec(  # noqa: S102 —— 受控目录内真实执行生产脚本
+                                    compile(
+                                        ANSWER_SOURCE_TEXT,
+                                        str(ANSWER_SOURCE_PATH),
+                                        "exec",
+                                    ),
+                                    namespace,
+                                )
+                            except SystemExit as exc:
+                                outcome = f"SystemExit:{exc.code}"
+                            except Exception as exc:  # noqa: BLE001
+                                message = str(exc).replace("|", "/")
+                                outcome = f"{type(exc).__name__}: {message}"[:90]
+                        called = str(post_mock.called)
+            finally:
+                os.chdir(saved_cwd)
+
+            answer_file = out_dir / "answer_qdrant.json"
+            saved = "True" if answer_file.exists() else "False"
+            used: Any = "-"
+            friendly_model = "-"
+            if answer_file.exists():
+                data = json.loads(answer_file.read_text(encoding="utf-8"))
+                used = data.get("used_citations", "?")
+                friendly_model = str(data.get("model") == "fallback").lower()
+    finally:
+        if Path.cwd() != saved_cwd:
+            os.chdir(saved_cwd)
+
+    return (
+        f"{outcome}|friendly_model={friendly_model}|used={used}"
+        f"|saved={saved}|called={called}"
+    )
+
+
+def startswith_any(prefixes: tuple[str, ...]) -> Callable[[str], bool]:
+    return lambda actual: any(actual.startswith(p) for p in prefixes)
+
+
+VALID_CITATION_EXPECTED_PREFIX = "completed|friendly_model=false|used=['E1']"
+
+
+# --------------------------------------------------------------------------
+# data-integration：索引四方一致性与过期检测（产物缺失时 SKIPPED）
+# --------------------------------------------------------------------------
+
+
+def _index_artifacts_present() -> bool:
+    return (
+        (INDEX_DIR / "embedding_manifest.json").exists()
+        and (INDEX_DIR / "chunks_merged.jsonl").exists()
+        and (INDEX_DIR / "embeddings.npy").exists()
+        and (INDEX_DIR / "qdrant_storage").is_dir()
+    )
+
+
+def run_index_four_way() -> str:
+    """manifest / chunks_merged / embeddings.npy / Qdrant 四方对齐。"""
+    if not _index_artifacts_present():
+        return "SKIP:index artifacts missing"
+    manifest = json.loads(
+        (INDEX_DIR / "embedding_manifest.json").read_text(encoding="utf-8")
+    )
+    chunk_lines = [
+        json.loads(line)
+        for line in (INDEX_DIR / "chunks_merged.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    matrix = np.load(INDEX_DIR / "embeddings.npy", mmap_mode="r")
+
+    from qdrant_client import QdrantClient
+
+    client = QdrantClient(path=str(INDEX_DIR / "qdrant_storage"))
+    try:
+        stored = client.count(
+            collection_name=peq.COLLECTION_NAME, exact=True
+        ).count
+    finally:
+        client.close()
+
+    counts_ok = (
+        int(matrix.shape[0]) == len(chunk_lines)
+        == int(manifest["chunk_count"])
+        == stored
+    )
+    dim_ok = int(matrix.shape[1]) == int(manifest["embedding_dimension"])
+    ids_ok = [row["chunk_id"] for row in chunk_lines] == list(
+        manifest["chunk_ids"]
+    )
+    norms_ok = bool(
+        np.allclose(
+            np.linalg.norm(np.asarray(matrix), axis=1), 1.0, atol=1e-4
+        )
+    )
+    return (
+        f"counts_equal={counts_ok}|dim_match={dim_ok}"
+        f"|id_order_aligned={ids_ok}|unit_norm_rows={norms_ok}"
+        f"|total={len(chunk_lines)}"
+    )
+
+
+def run_index_staleness() -> str:
+    """过期索引检测：重算 chunks_merged 的 SHA256 与 manifest 记录比对。"""
+    manifest_path = INDEX_DIR / "embedding_manifest.json"
+    chunks_path = INDEX_DIR / "chunks_merged.jsonl"
+    if not (manifest_path.exists() and chunks_path.exists()):
+        return "SKIP:index artifacts missing"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    recorded = str(manifest.get("source_chunks_sha256", ""))
+    digest = hashlib.sha256(chunks_path.read_bytes()).hexdigest()
+    return "fresh" if digest == recorded else "stale"
 
 
 # --------------------------------------------------------------------------
 # P0 清单定义
 # --------------------------------------------------------------------------
 
-# 字段：id, level, input, expected, runner, predicate(可选)
 P0_DEFS: list[dict[str, Any]] = [
     # ---- G 平台门控（unit）----
     {
@@ -371,7 +600,7 @@ P0_DEFS: list[dict[str, Any]] = [
             threshold_env="abc",
         ),
     },
-    # ---- E Evidence Gate（unit，直接驱动 evaluate_evidence）----
+    # ---- E Evidence Gate（unit）----
     {
         "id": "P0-E-20",
         "level": "unit",
@@ -460,7 +689,7 @@ P0_DEFS: list[dict[str, Any]] = [
             ],
         ),
     },
-    # ---- B 真实检索边界（unit+底层 Mock，跑真 retrieve_and_rank）----
+    # ---- B 真实检索边界（unit+底层 Mock）----
     {
         "id": "P0-B-30",
         "level": "unit+mock",
@@ -500,11 +729,144 @@ P0_DEFS: list[dict[str, Any]] = [
         "runner": lambda: (
             "wired"
             if '"blocked_intent_uncertain": UNCERTAIN_FALLBACK'
-            in ANSWER_SOURCE_PATH.read_text(encoding="utf-8")
+            in ANSWER_SOURCE_TEXT
             else "missing"
         ),
     },
-    # ---- N 在线分类（integration-online，缺 Key 自动跳过）----
+    # ---- A 回答脚本真实执行（unit+Mock httpx；真实文件 I/O 与全部生产代码路径）----
+    {
+        "id": "P0-A-70",
+        "level": "unit+mock",
+        "input": "ready 包 + 模型回答含合法引用 [E1]",
+        "expected": "completed|friendly_model=false|used=['E1']",
+        "predicate": lambda a: a.startswith(
+            "completed|friendly_model=false|used=['E1']"
+        ),
+        "runner": lambda: run_answer_case(
+            make_bundle("ready_for_grounding"),
+            post_return=fake_deepseek_response(
+                200,
+                chat_payload("根据规则，买家提交退款申请后系统将自动审核订单信息。[E1]"),
+            ),
+        ),
+    },
+    {
+        "id": "P0-A-71",
+        "level": "unit+mock",
+        "input": "模型回答引用了不存在于证据包的 [E9]",
+        "expected": "ValueError: Unknown citations: {'E9'} 且不写答案文件",
+        "predicate": lambda a: a.startswith("ValueError: Unknown citations")
+        and a.endswith("|saved=False|called=True"),
+        "runner": lambda: run_answer_case(
+            make_bundle("ready_for_grounding"),
+            post_return=fake_deepseek_response(
+                200, chat_payload("这与规则无关。[E9]")
+            ),
+        ),
+    },
+    {
+        "id": "P0-A-72",
+        "level": "unit+mock",
+        "input": "非固定话术但完全无引用的回答",
+        "expected": "ValueError: Answer contains no citation",
+        "predicate": lambda a: a.startswith("ValueError: Answer contains no citation"),
+        "runner": lambda: run_answer_case(
+            make_bundle("ready_for_grounding"),
+            post_return=fake_deepseek_response(
+                200, chat_payload("可以直接退款，不需要任何依据。")
+            ),
+        ),
+    },
+    {
+        "id": "P0-A-73",
+        "level": "unit+mock",
+        "input": "bundle.status=blocked_intent_uncertain",
+        "expected": "SystemExit:0|friendly_model=true|used=[]|saved=True|called=False",
+        "predicate": lambda a: a.startswith(
+            "SystemExit:0|friendly_model=true|used=[]"
+        )
+        and a.endswith("|saved=True|called=False"),
+        "runner": lambda: run_answer_case(make_bundle("blocked_intent_uncertain")),
+    },
+    {
+        "id": "P0-A-74",
+        "level": "unit+mock",
+        "input": "bundle.status=blocked_low_relevance（非友好拦截）",
+        "expected": "SystemExit: Evidence gate blocked: blocked_low_relevance",
+        "predicate": lambda a: a.startswith(
+            "SystemExit:Evidence gate blocked: blocked_low_relevance"
+        )
+        and a.endswith("|saved=False|called=False"),
+        "runner": lambda: run_answer_case(make_bundle("blocked_low_relevance")),
+    },
+    {
+        "id": "P0-A-75",
+        "level": "unit+mock",
+        "input": "环境缺少 DEEPSEEK_API_KEY",
+        "expected": "SystemExit: DEEPSEEK_API_KEY is not set",
+        "predicate": lambda a: a.startswith(
+            "SystemExit:DEEPSEEK_API_KEY is not set"
+        ),
+        "runner": lambda: run_answer_case(
+            make_bundle("ready_for_grounding"), api_key=None
+        ),
+    },
+    {
+        "id": "P0-A-76",
+        "level": "unit+mock",
+        "input": "DeepSeek HTTP 500",
+        "expected": "RuntimeError: DeepSeek API error 500",
+        "predicate": lambda a: a.startswith("RuntimeError: DeepSeek API error 500"),
+        "runner": lambda: run_answer_case(
+            make_bundle("ready_for_grounding"),
+            post_return=fake_deepseek_response(500, text="boom"),
+        ),
+    },
+    {
+        "id": "P0-A-77",
+        "level": "unit+mock",
+        "input": "DeepSeek HTTP 401",
+        "expected": "RuntimeError: DeepSeek API error 401",
+        "predicate": lambda a: a.startswith("RuntimeError: DeepSeek API error 401"),
+        "runner": lambda: run_answer_case(
+            make_bundle("ready_for_grounding"),
+            post_return=fake_deepseek_response(401, text="authz failed"),
+        ),
+    },
+    {
+        "id": "P0-A-78",
+        "level": "unit+mock",
+        "input": "DeepSeek HTTP 429",
+        "expected": "RuntimeError: DeepSeek API error 429",
+        "predicate": lambda a: a.startswith("RuntimeError: DeepSeek API error 429"),
+        "runner": lambda: run_answer_case(
+            make_bundle("ready_for_grounding"),
+            post_return=fake_deepseek_response(429, text="rate limited"),
+        ),
+    },
+    {
+        "id": "P0-A-79",
+        "level": "unit+mock",
+        "input": "DeepSeek 读超时",
+        "expected": "ReadTimeout 异常向上抛出",
+        "predicate": lambda a: a.startswith("ReadTimeout:"),
+        "runner": lambda: run_answer_case(
+            make_bundle("ready_for_grounding"),
+            post_side_effect=httpx.ReadTimeout("The read operation timed out"),
+        ),
+    },
+    {
+        "id": "P0-A-80",
+        "level": "unit+mock",
+        "input": "API 返回结构损坏 choices=[]",
+        "expected": "IndexError（当前行为如实记录）",
+        "predicate": lambda a: a.startswith("IndexError"),
+        "runner": lambda: run_answer_case(
+            make_bundle("ready_for_grounding"),
+            post_return=fake_deepseek_response(200, payload={"choices": []}),
+        ),
+    },
+    # ---- N 在线分类（integration-online，双条件开启）----
     {
         "id": "P0-N-50",
         "level": "integration-online",
@@ -519,19 +881,47 @@ P0_DEFS: list[dict[str, Any]] = [
         "expected": "intent=unrelated|final=blocked_unrelated_question",
         "runner": lambda: run_online_classify("公司代码审核怎么做"),
     },
-    # ---- H 重型集成冒烟（默认跳过，RAG_P0_HEAVY=1 开启）----
+    # ---- H 完整端到端重型集成（默认跳过，RAG_P0_HEAVY=1 开启）----
     {
         "id": "P0-H-60",
         "level": "integration-heavy",
-        "input": "真实 Embedding+Qdrant 检索（不加载 Reranker）",
-        "expected": "smoke: points>=1 且 platforms ⊆ {aliexpress,temu}",
-        "runner": run_heavy_retrieval,
-        "predicate": heavy_smoke_ok,
+        "input": "真实全模型链路: 平台=aliexpress",
+        "expected": "gate∈允许集, candidates≤TOP_K_RERANK, platforms==[aliexpress], 重排分数有限",
+        "predicate": lambda a: heavy_e2e_ok(a, "aliexpress"),
+        "runner": lambda: run_heavy_e2e("aliexpress"),
+    },
+    {
+        "id": "P0-H-61",
+        "level": "integration-heavy",
+        "input": "真实全模型链路: 平台=temu",
+        "expected": "同上但 platforms==[temu]",
+        "predicate": lambda a: heavy_e2e_ok(a, "temu"),
+        "runner": lambda: run_heavy_e2e("temu"),
+    },
+    # ---- I 索引一致性 / 过期检测（data-integration）----
+    {
+        "id": "P0-I-70",
+        "level": "data-integration",
+        "input": "manifest/chunks_merged/embeddings/Qdrant 四方对齐 + 单位范数",
+        "expected": "counts_equal=True|dim_match=True|id_order_aligned=True|unit_norm_rows=True",
+        "predicate": lambda a: a.startswith("counts_equal=True|dim_match=True")
+        and "id_order_aligned=True|unit_norm_rows=True" in a,
+        "runner": run_index_four_way,
+    },
+    {
+        "id": "P0-I-71",
+        "level": "data-integration",
+        "input": "重算 chunks_merged SHA256 对比 manifest 记录",
+        "expected": "fresh",
+        "predicate": lambda a: a == "fresh",
+        "runner": run_index_staleness,
     },
 ]
 
 ONLINE_IDS = {"P0-N-50", "P0-N-51"}
-HEAVY_IDS = {"P0-H-60"}
+HEAVY_IDS = {"P0-H-60", "P0-H-61"}
+ARTIFACT_IDS = {"P0-I-70", "P0-I-71"}
+SKIP_GATED_IDS = ONLINE_IDS | HEAVY_IDS | ARTIFACT_IDS
 
 
 # --------------------------------------------------------------------------
@@ -543,19 +933,24 @@ def execute_case(case_def: dict[str, Any]) -> dict[str, Any]:
     """执行单个案例并生成报告行（SKIP 不算失败）。"""
     case_id = case_def["id"]
 
-    if case_def.get("force_skip_actual") is None:
-        if case_id in ONLINE_IDS and not _ensure_online_api_key():
-            return {
-                **case_def,
-                "actual": "SKIPPED: DEEPSEEK_API_KEY not available",
-                "passed": "SKIP",
-            }
-        if case_id in HEAVY_IDS and os.environ.get("RAG_P0_HEAVY") != "1":
-            return {
-                **case_def,
-                "actual": "SKIPPED: set RAG_P0_HEAVY=1 to enable",
-                "passed": "SKIP",
-            }
+    if case_id in ARTIFACT_IDS and not _index_artifacts_present():
+        return {
+            **case_def,
+            "actual": "SKIPPED: output artifacts missing",
+            "passed": "SKIP",
+        }
+    if case_id in ONLINE_IDS and not _online_mode_enabled():
+        return {
+            **case_def,
+            "actual": "SKIPPED: requires RAG_P0_ONLINE=1 AND DEEPSEEK_API_KEY",
+            "passed": "SKIP",
+        }
+    if case_id in HEAVY_IDS and os.environ.get("RAG_P0_HEAVY") != "1":
+        return {
+            **case_def,
+            "actual": "SKIPPED: set RAG_P0_HEAVY=1 to enable",
+            "passed": "SKIP",
+        }
 
     try:
         actual = case_def["runner"]()
@@ -616,23 +1011,25 @@ def main() -> int:
 
 
 # --------------------------------------------------------------------------
-# unittest 接入
+# unittest 接入（按 ID 查找，避免位置索引脆弱）
 # --------------------------------------------------------------------------
 
-_ONLINE_AVAILABLE = _ensure_online_api_key()
+_ONLINE_ENABLED = _online_mode_enabled()
 _HEAVY_ENABLED = os.environ.get("RAG_P0_HEAVY") == "1"
+INDEX_BY_ID = {case_def["id"]: case_def for case_def in P0_DEFS}
 
 
 class DeterministicP0Tests(unittest.TestCase):
-    """全部 unit / unit+mock 案例按清单逐一断言。"""
+    """全部非门控型案例：unit / unit+mock / data-integration 均可离线执行。"""
 
-    def test_deterministic_registry(self):
+    def test_registry(self):
+        ids = [case_def["id"] for case_def in P0_DEFS]
+        self.assertEqual(len(ids), len(set(ids)), "案例 ID 必须唯一")
         deterministic_defs = [
-            case_def
-            for case_def in P0_DEFS
-            if case_def["level"] in {"unit", "unit+mock"}
+            case_def for case_def in P0_DEFS if case_def["id"] not in SKIP_GATED_IDS
         ]
-        self.assertEqual(len(deterministic_defs), 24)
+        # G6+R6+E7+B2+F3+A11 = 35（N/H/I 三组由各自门控类执行）
+        self.assertEqual(len(deterministic_defs), 35)
         for case_def in deterministic_defs:
             with self.subTest(case_id=case_def["id"]):
                 row = execute_case(case_def)
@@ -644,32 +1041,30 @@ class DeterministicP0Tests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    _ONLINE_AVAILABLE, "DEEPSEEK_API_KEY not available (integration-online)"
+    _ONLINE_ENABLED,
+    "integration-online requires RAG_P0_ONLINE=1 AND DEEPSEEK_API_KEY",
 )
 class OnlineP0Tests(unittest.TestCase):
-    """真实 DeepSeek 分类 + 生产门控映射；无 Key 时整类跳过。"""
+    """真实 DeepSeek 分类；双条件缺失时整类跳过。"""
 
-    def test_p0_n_50_real_refund_query(self):
-        row = execute_case(P0_DEFS[24])
-        self.assertEqual(row["id"], "P0-N-50")
-        self.assertEqual(row["passed"], "PASS")
-
-    def test_p0_n_51_real_unrelated_query(self):
-        row = execute_case(P0_DEFS[25])
-        self.assertEqual(row["id"], "P0-N-51")
-        self.assertEqual(row["passed"], "PASS")
+    def test_online_cases(self):
+        for case_id in sorted(ONLINE_IDS):
+            with self.subTest(case_id=case_id):
+                row = execute_case(INDEX_BY_ID[case_id])
+                self.assertEqual(row["passed"], "PASS", row["actual"])
 
 
 @unittest.skipUnless(
-    _HEAVY_ENABLED, "set RAG_P0_HEAVY=1 to enable integration-heavy"
+    _HEAVY_ENABLED, "integration-heavy requires RAG_P0_HEAVY=1"
 )
 class HeavyP0Tests(unittest.TestCase):
-    """真实 Embedding+Qdrant 冒烟；默认跳过。"""
+    """真实全模型端到端检索；默认跳过。"""
 
-    def test_p0_h_60_heavy_smoke(self):
-        row = execute_case(P0_DEFS[26])
-        self.assertEqual(row["id"], "P0-H-60")
-        self.assertEqual(row["passed"], "PASS")
+    def test_heavy_cases(self):
+        for case_id in sorted(HEAVY_IDS):
+            with self.subTest(case_id=case_id):
+                row = execute_case(INDEX_BY_ID[case_id])
+                self.assertEqual(row["passed"], "PASS", row["actual"])
 
 
 if __name__ == "__main__":
