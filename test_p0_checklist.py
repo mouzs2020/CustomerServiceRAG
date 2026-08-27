@@ -478,6 +478,10 @@ def run_index_four_way() -> str:
     id_set_equal = (
         set(stored_ids) == set(manifest["chunk_ids"]) == set(rows_by_id)
     )
+    # 行顺序校验：chunks_merged 第 N 行 == embeddings 第 N 行 == manifest 第 N 项
+    order_aligned = [row["chunk_id"] for row in chunk_lines] == list(
+        manifest["chunk_ids"]
+    )
     platform_aligned = all(
         str(p.payload.get("platform")) == rows_by_id[cid]["platform"]
         for cid, p in (
@@ -493,6 +497,7 @@ def run_index_four_way() -> str:
     return (
         f"counts_equal={counts_ok}|dim_match={dim_ok}"
         f"|ids_unique={ids_unique}|id_set_equal={id_set_equal}"
+        f"|order_aligned={order_aligned}"
         f"|platform_aligned={platform_aligned}|unit_norm_rows={norms_ok}"
         f"|total={len(chunk_lines)}"
     )
@@ -928,12 +933,14 @@ P0_DEFS: list[dict[str, Any]] = [
         "id": "P0-I-70",
         "level": "data-integration",
         "input": "manifest/chunks_merged/embeddings/Qdrant 内容级对齐"
-                 "（含 scroll 逐点 chunk_id 集合与 platform 校验）",
+                 "（含逐点 chunk_id 集合、行顺序与 platform 校验）",
         "expected": "counts_equal=True|dim_match=True|ids_unique=True|"
-                    "id_set_equal=True|platform_aligned=True|unit_norm_rows=True",
+                    "id_set_equal=True|order_aligned=True|"
+                    "platform_aligned=True|unit_norm_rows=True",
         "predicate": lambda a: a.startswith(
             "counts_equal=True|dim_match=True|ids_unique=True|"
-            "id_set_equal=True|platform_aligned=True|unit_norm_rows=True"
+            "id_set_equal=True|order_aligned=True|"
+            "platform_aligned=True|unit_norm_rows=True"
         ),
         "runner": run_index_four_way,
     },
