@@ -96,8 +96,11 @@ def evaluate_case(
     final_status = decision_status if decision_status else ALLOWED_SENTINEL
 
     label_ok = returned_intent == expected_intent
-    allowed = decision_status is None
-    gate_ok = allowed == (expected_gate == "allow")
+    # 门控报错时无论预期 allow 还是 block 都必须判为失败：
+    # 报错说明门控本身不可用，不能因为“碰巧被拦截”而误判通过。
+    gate_ok = gate_error is None and (
+        (decision_status is None) == (expected_gate == "allow")
+    )
 
     mismatches = []
     if not label_ok:
@@ -117,7 +120,7 @@ def evaluate_case(
         "label_ok": label_ok,
         "gate_ok": gate_ok,
         "detail": "; ".join(mismatches),
-        "ok": label_ok and gate_ok,
+        "ok": label_ok and gate_ok and gate_error is None,
     }
 
 

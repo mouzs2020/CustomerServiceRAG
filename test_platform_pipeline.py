@@ -938,6 +938,32 @@ class EvalScriptTests(unittest.TestCase):
         # 汇总行仍然打印（未崩溃）。
         self.assertIn("accuracy:", captured)
 
+    def test_gate_error_with_expected_block_still_fails(self):
+        # 最后验收门控 P2：预期 block + 强制门控异常，
+        # 不能因为“碰巧被拦截”而误判 PASS。
+        import io
+        from contextlib import redirect_stdout
+
+        cases = [("你是什么模型", "unrelated", "block")]
+
+        def classifier(query):
+            return {"intent": "unrelated", "confidence": 0.95, "reason": "r"}
+
+        def broken_gate(result):
+            raise IntentClassifierError("forced gate failure")
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            exit_code = eval_module.run_evaluation(
+                classify_fn=classifier, cases=cases, gate_fn=broken_gate
+            )
+        captured = buffer.getvalue()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("[FAIL]", captured)
+        self.assertIn("final=blocked_intent_classifier_error", captured)
+        self.assertIn("forced gate failure", captured)
+
     def test_low_confidence_refund_fails_production_gate_check(self):
         # 复现评审场景：intent=refund_after_sales 但 confidence=0.1。
         # 旧版只看标签会 ok=True；生产管道实际 blocked_intent_uncertain，
