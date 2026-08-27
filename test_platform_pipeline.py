@@ -498,6 +498,7 @@ class AnswerScriptRoutingTests(unittest.TestCase):
             "blocked_no_matching_source",
             "blocked_intent_classifier_error",
             "blocked_evidence_gate_config_error",
+            "blocked_invalid_evidence",
         ):
             with self.subTest(status=status):
                 # 这些状态必须走 “Evidence gate blocked” 的报错路径，
@@ -753,8 +754,97 @@ class IntentThresholdPipelineTests(unittest.TestCase):
         self.assertEqual(bundle["evidence"], [])
 
 
+class EvaluateEvidenceStructuralTests(unittest.TestCase):
+    """门控修复2 P1：畸形候选必须 fail closed（blocked_invalid_evidence）。"""
+
+    def evaluate(self, candidates):
+        with mock.patch.dict(os.environ, {"MIN_RERANK_SCORE": "0.75"}):
+            return peq.evaluate_evidence("aliexpress", candidates)
+
+    @staticmethod
+    def one_candidate() -> dict:
+        return make_candidate("aliexpress", 6.0, "a-valid")
+
+    def assert_invalid(self, candidates):
+        status, reason, evidence, gate = self.evaluate(candidates)
+        self.assertEqual(status, "blocked_invalid_evidence")
+        self.assertEqual(evidence, [])
+        self.assertFalse(gate["passed"])
+        self.assertIn("candidate[0]", reason)
+        self.assertIn("candidate[0]", str(gate.get("invalid_reason")))
+        return reason
+
+    def test_non_number_rerank_score_rejected(self):
+        # 评审复现样例："rerank_score": "oops"
+        candidate = self.one_candidate()
+        candidate["rerank_score"] = "oops"
+        reason = self.assert_invalid([candidate])
+        self.assertIn("rerank_score", reason)
+
+    def test_missing_rerank_score_rejected(self):
+        candidate = self.one_candidate()
+        del candidate["rerank_score"]
+        reason = self.assert_invalid([candidate])
+        self.assertIn("rerank_score", reason)
+
+    def test_bool_rerank_score_rejected(self):
+        candidate = self.one_candidate()
+        candidate["rerank_score"] = True
+        self.assert_invalid([candidate])
+
+    def test_bad_retrieve_score_rejected(self):
+        candidate = self.one_candidate()
+        candidate["retrieve_score"] = {"wrapped": True}
+        self.assert_invalid([candidate])
+
+    def test_non_dict_record_rejected(self):
+        candidate = self.one_candidate()
+        candidate["record"] = None
+        self.assert_invalid([candidate])
+
+    def test_record_missing_text_field_rejected(self):
+        candidate = self.one_candidate()
+        del candidate["record"]["text"]
+        reason = self.assert_invalid([candidate])
+        self.assertIn("text", reason)
+
+    def test_headings_not_a_list_rejected(self):
+        candidate = self.one_candidate()
+        candidate["record"]["headings"] = "标题"
+        self.assert_invalid([candidate])
+
+    def test_non_dict_candidate_rejected(self):
+        self.assert_invalid(["junk"])
+
+    def test_nan_score_still_low_relevance_not_invalid(self):
+        # NaN 是合法数字类型：结构校验放行，由非有限分数防线接管。
+        candidate = self.one_candidate()
+        candidate["rerank_score"] = float("nan")
+        status, reason, evidence, _ = self.evaluate([candidate])
+        self.assertEqual(status, "blocked_low_relevance")
+        self.assertIn("non-finite", reason)
+        self.assertEqual(evidence, [])
+
+    def test_healthy_candidates_unaffected(self):
+        candidates = [
+            make_candidate("aliexpress", 6.0, "a-hi"),
+            make_candidate("aliexpress", 3.0, "a-lo"),
+        ]
+        status, _, evidence, gate = self.evaluate(candidates)
+        self.assertEqual(status, "ready_for_grounding")
+        self.assertTrue(gate["passed"])
+        self.assertEqual(len(evidence), 2)
+
+
 class EvalScriptTests(unittest.TestCase):
-    """REVIEW_bdaac5d P2-5：在线评测脚本（离线只测其统计逻辑）。"""
+    """在线评测脚本（REVIEW_bdaac5d P2-5 + 门控修复2 P2）。
+
+    离线只测统计逻辑：注入分类函数，门控使用真实
+    ``decide_after_intent``（默认阈值 0.8），保证 Eval 结论与
+    生产管道一致。
+    """
+
+    REAL_GATE = eval_module.decide_after_intent
 
     def test_missing_key_skips_without_network_or_classifier(self):
         # 不注入分类器走默认路径：无 Key 时必须跳过且不触网。
@@ -772,7 +862,10 @@ class EvalScriptTests(unittest.TestCase):
         clf_mock.assert_not_called()
 
     def test_injected_perfect_classifier_passes(self):
-        cases = [("a", "refund_after_sales"), ("b", "unrelated")]
+        cases = [
+            ("a", "refund_after_sales", "allow"),
+            ("b", "unrelated", "block"),
+        ]
 
         def classifier(query):
             intent = "refund_after_sales" if query == "a" else "unrelated"
@@ -783,13 +876,14 @@ class EvalScriptTests(unittest.TestCase):
         )
         self.assertEqual(exit_code, 0)
 
-    def test_mismatch_counts_as_failure(self):
+    def test_label_mismatch_counts_as_failure(self):
+        cases = [("退款流程是什么", "refund_after_sales", "allow")]
+
         def wrong(query):
             return {"intent": "unrelated", "confidence": 0.9, "reason": "r"}
 
         exit_code = eval_module.run_evaluation(
-            classify_fn=wrong,
-            cases=[("退款流程是什么", "refund_after_sales")],
+            classify_fn=wrong, cases=cases
         )
         self.assertEqual(exit_code, 1)
 
@@ -799,9 +893,67 @@ class EvalScriptTests(unittest.TestCase):
 
         exit_code = eval_module.run_evaluation(
             classify_fn=broken,
-            cases=[("退款流程是什么", "refund_after_sales")],
+            cases=[("退款流程是什么", "refund_after_sales", "allow")],
         )
         self.assertEqual(exit_code, 1)
+
+    # ---- 门控修复2 P2：置信度低于生产阈值时 Eval 不能误判通过 ----
+
+    def test_low_confidence_refund_fails_production_gate_check(self):
+        # 复现评审场景：intent=refund_after_sales 但 confidence=0.1。
+        # 旧版只看标签会 ok=True；生产管道实际 blocked_intent_uncertain，
+        # 因此新版必须退出码 1 且 final_status 反映拦截。
+        import io
+        from contextlib import redirect_stdout
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            exit_code = eval_module.run_evaluation(
+                classify_fn=lambda q: {
+                    "intent": "refund_after_sales",
+                    "confidence": 0.1,
+                    "reason": "r",
+                },
+                cases=[("退款流程是什么", "refund_after_sales", "allow")],
+            )
+        captured = buffer.getvalue()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("final=blocked_intent_uncertain", captured)
+        self.assertIn("gate mismatch", captured)
+
+
+class EvalSummaryUnitTests(unittest.TestCase):
+    """summarize 的分项错误计数。"""
+
+    @staticmethod
+    def make_result(label_ok: bool, gate_ok: bool) -> dict:
+        return {
+            "label_ok": label_ok,
+            "gate_ok": gate_ok,
+            "ok": label_ok and gate_ok,
+        }
+
+    def test_breakdown_counts(self):
+        summary = eval_module.summarize(
+            [
+                self.make_result(True, True),
+                self.make_result(False, True),   # 仅标签错
+                self.make_result(True, False),   # 仅门控错
+                self.make_result(False, False),  # 双错
+            ]
+        )
+        self.assertEqual(summary["total"], 4)
+        self.assertEqual(summary["correct"], 1)
+        self.assertEqual(summary["error_count"], 3)
+        self.assertEqual(summary["label_mismatch_count"], 2)
+        self.assertEqual(summary["gate_mismatch_count"], 2)
+
+    def test_empty_results_are_safe(self):
+        summary = eval_module.summarize([])
+        self.assertEqual(summary["total"], 0)
+        self.assertEqual(summary["accuracy"], 0.0)
+        self.assertEqual(summary["error_count"], 0)
 
 
 if __name__ == "__main__":

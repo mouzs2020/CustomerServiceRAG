@@ -136,6 +136,56 @@ def decide_after_intent(
     return None, "Platform gate and intent classification passed"
 
 
+def _find_invalid_candidate(
+    reranked_candidates: list[dict[str, object]],
+) -> str | None:
+    """逐个校验候选结构；返回第一个问题的描述，全部合法返回 None。
+
+    必须满足：
+    - 候选是 dict，且含数字类型的 ``rerank_score`` / ``retrieve_score``
+      （bool 视为非法）；
+    - ``record`` 是 dict，并包含字符串字段 chunk_id / source_id /
+      platform / text，以及列表类型 headings。
+
+    任何结构异常都会让 Evidence Gate fail closed（blocked_invalid_evidence），
+    而不是在计算分数或组装证据包时抛出 ValueError/KeyError。
+    """
+    for index, item in enumerate(reranked_candidates):
+        prefix = f"candidate[{index}]"
+
+        if not isinstance(item, dict):
+            return f"{prefix}: candidate is not a dict ({type(item).__name__})"
+
+        score = item.get("rerank_score")
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            return (
+                f"{prefix}: rerank_score is not a number ({score!r})"
+            )
+
+        retrieve_score = item.get("retrieve_score")
+        if isinstance(retrieve_score, bool) or not isinstance(
+            retrieve_score, (int, float)
+        ):
+            return (
+                f"{prefix}: retrieve_score is not a number "
+                f"({retrieve_score!r})"
+            )
+
+        record = item.get("record")
+        if not isinstance(record, dict):
+            return f"{prefix}: record is not a dict ({type(record).__name__})"
+
+        for field in ("chunk_id", "source_id", "platform", "text"):
+            value = record.get(field)
+            if not isinstance(value, str):
+                return f"{prefix}: record field {field} is not a string"
+
+        if not isinstance(record.get("headings"), list):
+            return f"{prefix}: record field headings is not a list"
+
+    return None
+
+
 def evaluate_evidence(
     requested_platform: str,
     reranked_candidates: list[dict[str, object]],
@@ -144,7 +194,9 @@ def evaluate_evidence(
 
     至少检查：
     - 阈值配置是否为有限数字（非法时 fail closed，
-      新增状态 ``blocked_evidence_gate_config_error``）；
+      状态 ``blocked_evidence_gate_config_error``）；
+    - 候选结构是否完整（缺字段 / 非数字分数 / 损坏 payload 一律
+      fail closed，状态 ``blocked_invalid_evidence``）；
     - 是否存在候选证据；
     - 每条证据的 platform 是否等于 requested_platform；
     - 最高 rerank 分数是否达到阈值（get_min_rerank_score）；
@@ -153,7 +205,10 @@ def evaluate_evidence(
     返回 ``(status, reason, evidence, gate_info)``；
     blocked 状态下 evidence 恒为 []，gate_info["passed"] 为 False。
     """
-    # 配置校验最先执行：阈值非法时拒绝给出任何“通过”结论。
+    # 结构校验最先执行：畸形候选会让任何后续计算崩溃，
+    # 必须先拦截并 fail closed。
+    structure_error = _find_invalid_candidate(reranked_candidates)
+
     try:
         min_score = get_min_rerank_score()
         config_error: str | None = None
@@ -161,20 +216,35 @@ def evaluate_evidence(
         min_score = None
         config_error = str(exc)
 
-    scores = [float(item["rerank_score"]) for item in reranked_candidates]
-    finite_scores = [score for score in scores if math.isfinite(score)]
+    if structure_error is None:
+        scores = [float(item["rerank_score"]) for item in reranked_candidates]
+        finite_scores = [score for score in scores if math.isfinite(score)]
+        top_rerank: object = max(finite_scores) if finite_scores else None
+    else:
+        scores = []
+        finite_scores = []
+        top_rerank = None
 
     gate_info: dict[str, object] = {
         "passed": False,
         "min_rerank_score": min_score,
         "checked_candidates": len(reranked_candidates),
-        "top_rerank_score": max(finite_scores) if finite_scores else None,
+        "top_rerank_score": top_rerank,
     }
 
     if config_error is not None:
         return (
             "blocked_evidence_gate_config_error",
             f"Evidence gate misconfigured: {config_error}",
+            [],
+            gate_info,
+        )
+
+    if structure_error is not None:
+        gate_info["invalid_reason"] = structure_error
+        return (
+            "blocked_invalid_evidence",
+            f"Evidence gate rejected malformed candidate(s): {structure_error}",
             [],
             gate_info,
         )
@@ -196,11 +266,12 @@ def evaluate_evidence(
             gate_info,
         )
 
+    # 结构已校验：record["platform"] 保证存在且为字符串。
     mismatched_platforms = sorted(
         {
-            str(item["record"].get("platform"))
+            item["record"]["platform"]
             for item in reranked_candidates
-            if item["record"].get("platform") != requested_platform
+            if item["record"]["platform"] != requested_platform
         }
     )
     if mismatched_platforms:
