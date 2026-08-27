@@ -130,7 +130,10 @@ def run_routing_bundle_status(argv: list[str], **kwargs) -> str:
                 kwargs.get("intent_return") or dict(GOOD_INTENT_RESULT)
             )
         retrieve_mock.return_value = list(kwargs.get("candidates") or [])
-        peq.main()
+        # 捕获 peq.main() 的标准输出：完整证据包 JSON 绝不进入测试日志。
+        noise = io.StringIO()
+        with redirect_stdout(noise):
+            peq.main()
         called = retrieve_mock.called
         bundle = json.loads(output_path_mock.write_text.call_args.args[0])
     return f"{bundle['status']}|retrieve_called={called}"
@@ -427,7 +430,11 @@ def _index_artifacts_present() -> bool:
 
 
 def run_index_four_way() -> str:
-    """manifest / chunks_merged / embeddings.npy / Qdrant 四方对齐。"""
+    """四方一致性（内容级）：manifest / chunks_merged / embeddings / Qdrant。
+
+    Qdrant 采用 scroll 遍历真实 payload：比较 chunk_id 唯一性、集合一致，
+    以及每个存储点的 platform 与 chunk 文件逐条对齐。
+    """
     if not _index_artifacts_present():
         return "SKIP:index artifacts missing"
     manifest = json.loads(
@@ -446,21 +453,38 @@ def run_index_four_way() -> str:
 
     client = QdrantClient(path=str(INDEX_DIR / "qdrant_storage"))
     try:
-        stored = client.count(
+        stored_count = client.count(
             collection_name=peq.COLLECTION_NAME, exact=True
         ).count
+        stored_points, _offset = client.scroll(
+            collection_name=peq.COLLECTION_NAME,
+            limit=1000,
+            with_payload=True,
+            with_vectors=False,
+        )
     finally:
         client.close()
 
+    rows_by_id = {row["chunk_id"]: row for row in chunk_lines}
+    stored_ids = [str(p.payload.get("chunk_id")) for p in stored_points]
+
     counts_ok = (
-        int(matrix.shape[0]) == len(chunk_lines)
+        len(stored_ids) == len(chunk_lines)
         == int(manifest["chunk_count"])
-        == stored
+        == stored_count
     )
     dim_ok = int(matrix.shape[1]) == int(manifest["embedding_dimension"])
-    ids_ok = [row["chunk_id"] for row in chunk_lines] == list(
-        manifest["chunk_ids"]
+    ids_unique = len(set(stored_ids)) == len(stored_ids)
+    id_set_equal = (
+        set(stored_ids) == set(manifest["chunk_ids"]) == set(rows_by_id)
     )
+    platform_aligned = all(
+        str(p.payload.get("platform")) == rows_by_id[cid]["platform"]
+        for cid, p in (
+            (str(p.payload.get("chunk_id")), p) for p in stored_points
+        )
+        if cid in rows_by_id
+    ) and id_set_equal
     norms_ok = bool(
         np.allclose(
             np.linalg.norm(np.asarray(matrix), axis=1), 1.0, atol=1e-4
@@ -468,7 +492,8 @@ def run_index_four_way() -> str:
     )
     return (
         f"counts_equal={counts_ok}|dim_match={dim_ok}"
-        f"|id_order_aligned={ids_ok}|unit_norm_rows={norms_ok}"
+        f"|ids_unique={ids_unique}|id_set_equal={id_set_equal}"
+        f"|platform_aligned={platform_aligned}|unit_norm_rows={norms_ok}"
         f"|total={len(chunk_lines)}"
     )
 
@@ -902,10 +927,14 @@ P0_DEFS: list[dict[str, Any]] = [
     {
         "id": "P0-I-70",
         "level": "data-integration",
-        "input": "manifest/chunks_merged/embeddings/Qdrant 四方对齐 + 单位范数",
-        "expected": "counts_equal=True|dim_match=True|id_order_aligned=True|unit_norm_rows=True",
-        "predicate": lambda a: a.startswith("counts_equal=True|dim_match=True")
-        and "id_order_aligned=True|unit_norm_rows=True" in a,
+        "input": "manifest/chunks_merged/embeddings/Qdrant 内容级对齐"
+                 "（含 scroll 逐点 chunk_id 集合与 platform 校验）",
+        "expected": "counts_equal=True|dim_match=True|ids_unique=True|"
+                    "id_set_equal=True|platform_aligned=True|unit_norm_rows=True",
+        "predicate": lambda a: a.startswith(
+            "counts_equal=True|dim_match=True|ids_unique=True|"
+            "id_set_equal=True|platform_aligned=True|unit_norm_rows=True"
+        ),
         "runner": run_index_four_way,
     },
     {
@@ -1062,6 +1091,19 @@ class HeavyP0Tests(unittest.TestCase):
 
     def test_heavy_cases(self):
         for case_id in sorted(HEAVY_IDS):
+            with self.subTest(case_id=case_id):
+                row = execute_case(INDEX_BY_ID[case_id])
+                self.assertEqual(row["passed"], "PASS", row["actual"])
+
+
+@unittest.skipUnless(
+    _index_artifacts_present(), "output index artifacts missing"
+)
+class IndexP0Tests(unittest.TestCase):
+    """索引一致性与过期检测——纳入 unittest discovery，产物缺失时跳过。"""
+
+    def test_index_cases(self):
+        for case_id in sorted(ARTIFACT_IDS):
             with self.subTest(case_id=case_id):
                 row = execute_case(INDEX_BY_ID[case_id])
                 self.assertEqual(row["passed"], "PASS", row["actual"])
