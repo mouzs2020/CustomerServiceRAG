@@ -1,7 +1,26 @@
+"""平台门控 + DeepSeek 意图分类 + Qdrant 检索重排 + Evidence Gate。
+
+调用顺序（每一层通过才会进入下一层）：
+1. 确定性平台门控（platform_gate.resolve_platform）；
+2. DeepSeek 意图分类（intent_classifier.classify_intent）；
+3. 检索重排（Qdrant 平台过滤 + BGE Reranker，本文件不改动其内部逻辑）；
+4. Evidence Gate 二次校验（evaluate_evidence）。
+
+任何 blocked 状态都会写出 ``evidence: []`` 的证据包，
+并且不会触碰后续组件。
+"""
+
 import argparse
 import json
+import math
+import os
 from pathlib import Path
 
+from intent_classifier import (
+    IntentClassifierError,
+    classify_intent,
+    get_intent_confidence_threshold,
+)
 from platform_gate import resolve_platform
 
 
@@ -16,16 +35,191 @@ TOP_K = 5
 RERANKER_ID = "BAAI/bge-reranker-base"
 TOP_K_RERANK = 3
 
+# Reranker 分数阈值初始防线：尚未通过评测标定，仅用于拦截明显不相关证据。
+DEFAULT_MIN_RERANK_SCORE = 0.75
 
-def build_blocked_bundle(query: str, gate: dict[str, object]) -> dict[str, object]:
+
+def get_min_rerank_score() -> float:
+    """Reranker 分数阈值（环境变量 MIN_RERANK_SCORE 可覆盖，默认 0.75）。
+
+    注意：默认值未经评测确定，不是可靠阈值，调参前请先做检索评测。
+    """
+    raw = os.environ.get("MIN_RERANK_SCORE")
+    if not raw:
+        return DEFAULT_MIN_RERANK_SCORE
+    return float(raw)
+
+
+def build_evidence_bundle(
+    query: str,
+    status: str,
+    reason: str,
+    requested_platform: object,
+    entry_platform: object,
+    *,
+    intent_result: dict[str, object] | None = None,
+    evidence_gate: dict[str, object] | None = None,
+    evidence: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """组装证据包；既有字段全部保留，新增意图与证据门字段。"""
+    if intent_result is None:
+        intent_value: object = None
+        confidence_value: object = None
+        reason_value: object = None
+    else:
+        intent_value = intent_result["intent"]
+        confidence_value = intent_result["confidence"]
+        reason_value = intent_result["reason"]
+
     return {
         "query": query,
-        "status": gate["status"],
-        "reason": gate["reason"],
-        "requested_platform": gate["requested_platform"],
-        "entry_platform": gate["entry_platform"],
-        "evidence": [],
+        "status": status,
+        "reason": reason,
+        "requested_platform": requested_platform,
+        "entry_platform": entry_platform,
+        "intent": intent_value,
+        "intent_confidence": confidence_value,
+        "intent_reason": reason_value,
+        "evidence_gate": evidence_gate,
+        "evidence": evidence if evidence is not None else [],
     }
+
+
+def decide_after_intent(
+    intent_result: dict[str, object],
+) -> tuple[str | None, str]:
+    """根据意图分类结果决定下一步状态。
+
+    返回 ``(status, reason)``；status 为 None 表示通过，允许进入检索。
+    """
+    intent = intent_result["intent"]
+    confidence = float(intent_result["confidence"])  # type: ignore[arg-type]
+
+    if intent == "unrelated":
+        return (
+            "blocked_unrelated_question",
+            "Intent classifier marked the question as unrelated",
+        )
+
+    if intent == "uncertain":
+        return (
+            "blocked_intent_uncertain",
+            "Intent classifier returned uncertain",
+        )
+
+    threshold = get_intent_confidence_threshold()
+    if confidence < threshold:
+        return (
+            "blocked_intent_uncertain",
+            f"Intent confidence {confidence:.2f} below threshold {threshold:.2f}",
+        )
+
+    return None, "Platform gate and intent classification passed"
+
+
+def evaluate_evidence(
+    requested_platform: str,
+    reranked_candidates: list[dict[str, object]],
+) -> tuple[str, str, list[dict[str, object]], dict[str, object]]:
+    """Evidence Gate 二次校验（独立函数，不混入 Citation Validator）。
+
+    至少检查：
+    - 是否存在候选证据；
+    - 每条证据的 platform 是否等于 requested_platform；
+    - 最高 rerank 分数是否达到阈值（get_min_rerank_score）；
+    - 进入证据包的条数不超过 TOP_K_RERANK。
+
+    返回 ``(status, reason, evidence, gate_info)``；
+    blocked 状态下 evidence 恒为 []，gate_info["passed"] 为 False。
+    """
+    scores = [float(item["rerank_score"]) for item in reranked_candidates]
+    finite_scores = [score for score in scores if math.isfinite(score)]
+
+    gate_info: dict[str, object] = {
+        "passed": False,
+        "min_rerank_score": get_min_rerank_score(),
+        "checked_candidates": len(reranked_candidates),
+        "top_rerank_score": max(finite_scores) if finite_scores else None,
+    }
+
+    if not reranked_candidates:
+        return (
+            "blocked_no_matching_source",
+            "No candidate matches the requested platform",
+            [],
+            gate_info,
+        )
+
+    # 防御：非有限分数（NaN/inf）按低相关处理，避免逃过阈值比较。
+    if len(finite_scores) != len(scores):
+        return (
+            "blocked_low_relevance",
+            "Reranker produced non-finite scores",
+            [],
+            gate_info,
+        )
+
+    mismatched_platforms = sorted(
+        {
+            str(item["record"].get("platform"))
+            for item in reranked_candidates
+            if item["record"].get("platform") != requested_platform
+        }
+    )
+    if mismatched_platforms:
+        return (
+            "blocked_platform_evidence_mismatch",
+            (
+                f"Evidence platforms {mismatched_platforms} do not match "
+                f"requested platform {requested_platform}"
+            ),
+            [],
+            gate_info,
+        )
+
+    min_score = float(gate_info["min_rerank_score"])
+    top_score = float(gate_info["top_rerank_score"])  # type: ignore[arg-type]
+    if top_score < min_score:
+        return (
+            "blocked_low_relevance",
+            f"Top rerank score {top_score:.3f} below minimum {min_score:.3f}",
+            [],
+            gate_info,
+        )
+
+    qualified = [
+        item for item in reranked_candidates
+        if float(item["rerank_score"]) >= min_score
+    ]
+    qualified.sort(key=lambda item: float(item["rerank_score"]), reverse=True)
+    limited = qualified[:TOP_K_RERANK]
+
+    evidence: list[dict[str, object]] = []
+    for index, item in enumerate(limited, start=1):
+        record = item["record"]
+        evidence.append(
+            {
+                "citation_id": f"E{index}",
+                "chunk_id": record["chunk_id"],
+                "source_id": record["source_id"],
+                "platform": record["platform"],
+                "headings": record["headings"],
+                "text": record["text"],
+                "retrieve_score": item["retrieve_score"],
+                "rerank_score": item["rerank_score"],
+            }
+        )
+
+    gate_info["passed"] = True
+    return (
+        "ready_for_grounding",
+        (
+            "Evidence gate passed; answer stage must still verify "
+            "that evidence supports the claim"
+        ),
+        evidence,
+        gate_info,
+    )
 
 
 def retrieve_and_rank(
@@ -34,8 +228,9 @@ def retrieve_and_rank(
 ) -> list[dict[str, object]]:
     """粗筛（Qdrant 平台过滤检索） + 重排。
 
-    只有平台门控通过后才会被调用，因此冲突 / 缺失 / 无关的场景
-    不会加载 Embedding 模型，也不会访问 Qdrant 或 Reranker。
+    只有平台门控与意图分类都通过后才会被调用，因此冲突 / 缺失 /
+    无关 / 不确定的场景不会加载 Embedding 模型、
+    也不会访问 Qdrant 或 Reranker。
     """
     import torch
     from qdrant_client import QdrantClient, models
@@ -119,10 +314,20 @@ def retrieve_and_rank(
     )
 
 
+def write_and_print(bundle: dict[str, object]) -> None:
+    """写出并打印证据包。"""
+    OUTPUT_PATH.write_text(
+        json.dumps(bundle, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps(bundle, ensure_ascii=False, indent=2))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Prepare the evidence bundle for the platform-gated RAG pipeline."
+            "Prepare the evidence bundle through the platform-gated, "
+            "intent-classified RAG pipeline."
         )
     )
     parser.add_argument(
@@ -141,66 +346,75 @@ def main() -> None:
     args = parser.parse_args()
 
     query = " ".join(args.query)
+
+    # 第 1 步：确定性平台门控（blocked 时不会触发意图分类和检索）。
     gate = resolve_platform(query, args.user_platform)
 
     if gate["status"] != "platform_resolved":
-        bundle = build_blocked_bundle(query, gate)
-        OUTPUT_PATH.write_text(
-            json.dumps(bundle, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        write_and_print(
+            build_evidence_bundle(
+                query=query,
+                status=str(gate["status"]),
+                reason=str(gate["reason"]),
+                requested_platform=gate["requested_platform"],
+                entry_platform=gate["entry_platform"],
+            )
         )
-        print(json.dumps(bundle, ensure_ascii=False, indent=2))
         return
 
     requested_platform = gate["requested_platform"]
+
+    # 第 2 步：DeepSeek 意图分类；失败属于 blocked_intent_classifier_error。
+    try:
+        intent_result = classify_intent(query)
+    except IntentClassifierError as exc:
+        write_and_print(
+            build_evidence_bundle(
+                query=query,
+                status="blocked_intent_classifier_error",
+                reason=f"Intent classifier failed: {exc}",
+                requested_platform=requested_platform,
+                entry_platform=gate["entry_platform"],
+            )
+        )
+        return
+
+    # 第 3 步：意图决策；unrelated / uncertain / 低置信度都在此拦截。
+    intent_status, intent_reason = decide_after_intent(intent_result)
+    if intent_status is not None:
+        write_and_print(
+            build_evidence_bundle(
+                query=query,
+                status=intent_status,
+                reason=intent_reason,
+                requested_platform=requested_platform,
+                entry_platform=gate["entry_platform"],
+                intent_result=intent_result,
+            )
+        )
+        return
+
+    # 第 4 步：检索 + 重排（Qdrant 平台过滤 + BGE Reranker）。
     all_reranked = retrieve_and_rank(query, requested_platform)
 
-    eligible = [
-        item
-        for item in all_reranked
-        if item["record"]["platform"] == requested_platform
-    ][:TOP_K_RERANK]
-
-    if eligible:
-        status = "ready_for_grounding"
-        reason = (
-            "Platform gate passed; answer stage must "
-            "still verify that evidence supports the claim"
-        )
-    else:
-        status = "blocked_no_matching_source"
-        reason = "No candidate matches the requested platform"
-
-    evidence = []
-    for index, item in enumerate(eligible, start=1):
-        record = item["record"]
-        evidence.append(
-            {
-                "citation_id": f"E{index}",
-                "chunk_id": record["chunk_id"],
-                "source_id": record["source_id"],
-                "platform": record["platform"],
-                "headings": record["headings"],
-                "text": record["text"],
-                "retrieve_score": item["retrieve_score"],
-                "rerank_score": item["rerank_score"],
-            }
-        )
-
-    bundle = {
-        "query": query,
-        "status": status,
-        "reason": reason,
-        "requested_platform": requested_platform,
-        "entry_platform": gate["entry_platform"],
-        "evidence": evidence,
-    }
-
-    OUTPUT_PATH.write_text(
-        json.dumps(bundle, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    # 第 5 步：Evidence Gate 二次校验。
+    evidence_status, evidence_reason, evidence, gate_info = evaluate_evidence(
+        requested_platform,
+        all_reranked,
     )
-    print(json.dumps(bundle, ensure_ascii=False, indent=2))
+
+    write_and_print(
+        build_evidence_bundle(
+            query=query,
+            status=evidence_status,
+            reason=evidence_reason,
+            requested_platform=requested_platform,
+            entry_platform=gate["entry_platform"],
+            intent_result=intent_result,
+            evidence_gate=gate_info,
+            evidence=evidence,
+        )
+    )
 
 
 if __name__ == "__main__":

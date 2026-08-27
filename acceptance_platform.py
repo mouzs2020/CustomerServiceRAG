@@ -1,10 +1,14 @@
-"""验收案例：验证平台门控（进入平台 + 问题平台）的新规则。
+"""验收案例：验证确定性平台门控（resolve_platform）的规则。
 
 运行方式：
     python acceptance_platform.py
 
-该脚本只测试纯逻辑（platform_gate），不加载向量模型，
-因此可以快速、无副作用地验证速卖通与 Temu 两组验收案例。
+该脚本只测试纯逻辑（platform_gate），不加载向量模型、不访问网络。
+
+注意：自引入 DeepSeek 意图分类器后，“是否属于退款 / 售后”的业务判断
+已从平台门控中移除——凡是能确定唯一平台的输入都会得到
+``platform_resolved``，由管线层的意图分类负责之后的拦截
+（见 test_platform_pipeline.py 与 intent_classifier.py）。
 """
 
 from platform_gate import resolve_platform
@@ -12,114 +16,121 @@ from platform_gate import resolve_platform
 
 CASES = [
     # (名称, user_platform, query, 期望 status, 期望 requested_platform)
+    # ---- 正常召回：入口 / 问题平台一致或互补 ----
     (
-        "A 能读到速卖通，问退款规则",
+        "A 入口速卖通，问退款规则",
         "aliexpress",
         "退款规则",
         "platform_resolved",
         "aliexpress",
     ),
     (
-        "B 读不到速卖通，但问题带速卖通",
+        "B 无入口，问题带速卖通",
         "",
         "速卖通退款规则",
         "platform_resolved",
         "aliexpress",
     ),
     (
-        "C 既无平台也无速卖通",
-        "",
-        "退款规则",
-        "blocked_missing_platform",
-        None,
+        "E 入口与问题都是速卖通",
+        "aliexpress",
+        "速卖通退款规则",
+        "platform_resolved",
+        "aliexpress",
     ),
     (
-        "D 读到速卖通，却问 Temu",
-        "aliexpress",
+        "A' 入口 Temu，问退款规则",
+        "temu",
+        "退款规则",
+        "platform_resolved",
+        "temu",
+    ),
+    (
+        "B' 无入口，问题带 Temu",
+        "",
         "Temu退款规则",
-        "blocked_platform_conflict",
-        None,
+        "platform_resolved",
+        "temu",
     ),
     (
-        "E 读到速卖通，也问速卖通",
+        "E' 入口与问题都是 Temu",
+        "temu",
+        "Temu退款规则",
+        "platform_resolved",
+        "temu",
+    ),
+    # ---- 交给意图分类器的透传案例（能确定唯一平台即放行）----
+    (
+        "G 入口速卖通，闲聊问模型（交意图分类）",
         "aliexpress",
-        "速卖通退款规则",
+        "你是什么模型",
         "platform_resolved",
         "aliexpress",
     ),
     (
-        "F 闲聊问模型",
-        "",
-        "你是什么模型",
-        "blocked_unrelated_question",
-        None,
-    ),
-    # ---- 反例：平台名只识别平台，不构成“售后相关” ----
-    (
-        "G 进入速卖通，闲聊问模型",
-        "aliexpress",
-        "你是什么模型",
-        "blocked_unrelated_question",
-        None,
-    ),
-    (
-        "H 进入 Temu，问天气",
+        "H 入口 Temu，问天气（交意图分类）",
         "temu",
         "今天天气怎么样",
-        "blocked_unrelated_question",
-        None,
+        "platform_resolved",
+        "temu",
     ),
     (
-        "I 问题带 Temu 但无关售后",
+        "I 问题带 Temu 的闲聊（交意图分类）",
         "",
         "Temu是什么模型",
-        "blocked_unrelated_question",
-        None,
+        "platform_resolved",
+        "temu",
     ),
     (
-        "J 问题带速卖通但无关售后",
+        "J 问题带速卖通的闲聊（交意图分类）",
         "",
         "速卖通老板是谁",
-        "blocked_unrelated_question",
-        None,
+        "platform_resolved",
+        "aliexpress",
     ),
-    # ---- Temu 反向 ----
     (
-        "A' 能读到 Temu，问退款规则",
+        "M 问招聘流程（交意图分类）",
+        "aliexpress",
+        "招聘流程是什么",
+        "platform_resolved",
+        "aliexpress",
+    ),
+    (
+        "N 问足球比赛规则（交意图分类）",
         "temu",
-        "退款规则",
+        "足球比赛规则是什么",
         "platform_resolved",
         "temu",
     ),
     (
-        "B' 读不到 Temu，但问题带 Temu",
-        "",
-        "Temu退款规则",
+        "O 问 Python 运行条件（交意图分类）",
+        "aliexpress",
+        "Python运行条件是什么",
         "platform_resolved",
-        "temu",
+        "aliexpress",
     ),
+    # ---- 确定性 blocked ----
     (
-        "C' 既无平台也无 Temu",
+        "C 既无入口也无平台",
         "",
         "退款规则",
         "blocked_missing_platform",
         None,
     ),
     (
-        "D' 读到 Temu，却问速卖通",
+        "D 入口速卖通，却问 Temu",
+        "aliexpress",
+        "Temu退款规则",
+        "blocked_platform_conflict",
+        None,
+    ),
+    (
+        "D' 入口 Temu，却问速卖通",
         "temu",
         "速卖通退款规则",
         "blocked_platform_conflict",
         None,
     ),
-    (
-        "E' 读到 Temu，也问 Temu",
-        "temu",
-        "Temu退款规则",
-        "platform_resolved",
-        "temu",
-    ),
-    # ---- 非法进入平台 ----
     (
         "K 非法进入平台",
         "suning",
@@ -127,7 +138,6 @@ CASES = [
         "blocked_invalid_entry_platform",
         None,
     ),
-    # ---- 多平台 ----
     (
         "L 同时问两个平台",
         "",
@@ -135,42 +145,12 @@ CASES = [
         "blocked_multiple_platforms",
         None,
     ),
-    # ---- 反例：泛化词（条件/流程/规则）不构成“售后相关” ----
     (
-        "M 问招聘流程",
-        "aliexpress",
-        "招聘流程是什么",
-        "blocked_unrelated_question",
-        None,
-    ),
-    (
-        "N 问足球比赛规则",
+        "P 多平台检查优先于冲突检查",
         "temu",
-        "足球比赛规则是什么",
-        "blocked_unrelated_question",
+        "速卖通和Temu哪个退款快",
+        "blocked_multiple_platforms",
         None,
-    ),
-    (
-        "O 问 Python 运行条件",
-        "aliexpress",
-        "Python运行条件是什么",
-        "blocked_unrelated_question",
-        None,
-    ),
-    # ---- 正例：领域词 + 泛化词组合仍然通过 ----
-    (
-        "P 问退款流程",
-        "aliexpress",
-        "退款流程是什么",
-        "platform_resolved",
-        "aliexpress",
-    ),
-    (
-        "Q 问退货条件",
-        "temu",
-        "退货条件是什么",
-        "platform_resolved",
-        "temu",
     ),
 ]
 
