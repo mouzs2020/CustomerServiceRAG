@@ -1,0 +1,47 @@
+{
+  "_note": "P0 checklist 固定测试数据：形状与 retrieve_and_rank 输出项一致。畸形变体由测试代码基于这些基础项深拷贝后局部破坏生成。",
+  "candidates": [
+    {
+      "record": {
+        "chunk_id": "fx-a-hi",
+        "source_id": "src-a:hash",
+        "document_id": "doc-a",
+        "platform": "aliexpress",
+        "headings": ["速卖通平台商品退款与售后处理规则", "第三章 退款审核流程"],
+        "text": "买家提交退款申请并上传凭证，系统自动审核订单基础信息。",
+        "contextualized_text": "速卖通平台商品退款与售后处理规则 > 第三章 退款审核流程\n买家提交退款申请并上传凭证。"
+      },
+      "retrieve_rank": 1,
+      "retrieve_score": 0.91,
+      "rerank_score": 6.4
+    },
+    {
+      "record": {
+        "chunk_id": "fx-a-lo",
+        "source_id": "src-a:hash",
+        "document_id": "doc-a",
+        "platform": "aliexpress",
+        "headings": ["速卖通平台商品退款与售后处理规则", "第七章 附则"],
+        "text": "平台保留根据市场环境调整退款规则的权利。",
+        "contextualized_text": "速卖通平台商品退款与售后处理规则 > 第七章 附则\n平台保留调整权利。"
+      },
+      "retrieve_rank": 2,
+      "retrieve_score": 0.84,
+      "rerank_score": 2.1
+    },
+    {
+      "record": {
+        "chunk_id": "fx-t-cross",
+        "source_id": "src-t:hash",
+        "document_id": "doc-t",
+        "platform": "temu",
+        "headings": ["Temu平台消费者退款与售后服务规则", "第四章 退款处理方式"],
+        "text": "符合条件的小额订单平台可能直接批准退款。",
+        "contextualized_text": "Temu平台消费者退款与售后服务规则 > 第四章 退款处理方式\n小额订单可能直接批准退款。"
+      },
+      "retrieve_rank": 1,
+      "retrieve_score": 0.77,
+      "rerank_score": 5.9
+    }
+  ]
+}

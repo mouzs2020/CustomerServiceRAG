@@ -56,12 +56,18 @@ EVAL_CASES: list[tuple[str, str, str]] = [
 ALLOWED_SENTINEL = "ready_for_grounding"
 
 
+def eval_case_id(index: int) -> str:
+    """按顺序生成稳定案例 ID（EVAL-01 起），供报告与引用使用。"""
+    return f"EVAL-{index + 1:02d}"
+
+
 def evaluate_case(
     classify_fn: ClassifierFn,
     gate_fn: GateFn,
     query: str,
     expected_intent: str,
     expected_gate: str,
+    case_id: str | None = None,
 ) -> dict[str, Any]:
     """运行单个评测案例，对齐标签与生产门控两个层面（不抛异常）。"""
     try:
@@ -70,6 +76,7 @@ def evaluate_case(
         confidence = result.get("confidence")
     except IntentClassifierError as exc:
         return {
+            "case_id": case_id,
             "query": query,
             "expected_intent": expected_intent,
             "expected_gate": expected_gate,
@@ -111,6 +118,7 @@ def evaluate_case(
         mismatches.append(f"gate error: {gate_error}")
 
     return {
+        "case_id": case_id,
         "query": query,
         "expected_intent": expected_intent,
         "expected_gate": expected_gate,
@@ -132,8 +140,15 @@ def evaluate_cases(
     """运行全部评测案例（标签 + 生产门控双重判定）。"""
     selected = EVAL_CASES if cases is None else cases
     return [
-        evaluate_case(classify_fn, gate_fn, query, expected_intent, expected_gate)
-        for query, expected_intent, expected_gate in selected
+        evaluate_case(
+            classify_fn,
+            gate_fn,
+            query,
+            expected_intent,
+            expected_gate,
+            case_id=eval_case_id(index),
+        )
+        for index, (query, expected_intent, expected_gate) in enumerate(selected)
     ]
 
 
@@ -185,8 +200,9 @@ def run_evaluation(
     print(f"intent classifier online eval: {summary['total']} cases")
     for item in results:
         mark = "PASS" if item["ok"] else "FAIL"
+        case_tag = item.get("case_id") or "-"
         print(
-            f"[{mark}] {item['query']!r} "
+            f"[{mark}] {case_tag} {item['query']!r} "
             f"label:{item['actual_intent']!r}/{item['expected_intent']} "
             f"conf={item['confidence']} "
             f"final={item['final_status']} "
