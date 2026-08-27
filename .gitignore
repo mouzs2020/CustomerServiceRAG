@@ -14,8 +14,12 @@ __pycache__/
 .env.*
 !.env.example
 *.key
+deepseek_api.env
 
 # Generated RAG artifacts
 output/
 *.npy
 *.log
+
+# Review notes
+.review-notes/
