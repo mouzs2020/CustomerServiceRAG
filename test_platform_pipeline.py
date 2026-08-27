@@ -792,6 +792,17 @@ class EvaluateEvidenceStructuralTests(unittest.TestCase):
         candidate["rerank_score"] = True
         self.assert_invalid([candidate])
 
+    def test_non_finite_retrieve_score_rejected(self):
+        # 门控修复3 P2-1：retrieve_score=nan/inf 会污染 JSON 输出，
+        # 必须判为非法候选而不是放行。
+        for bad_score in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad_score=bad_score):
+                candidate = self.one_candidate()
+                candidate["retrieve_score"] = bad_score
+                reason = self.assert_invalid([candidate])
+                self.assertIn("retrieve_score", reason)
+                self.assertIn("not finite", reason)
+
     def test_bad_retrieve_score_rejected(self):
         candidate = self.one_candidate()
         candidate["retrieve_score"] = {"wrapped": True}
@@ -898,6 +909,34 @@ class EvalScriptTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
 
     # ---- 门控修复2 P2：置信度低于生产阈值时 Eval 不能误判通过 ----
+
+    def test_gate_error_is_recorded_not_raised(self):
+        # 门控修复3 P2-2：INTENT_CONFIDENCE_THRESHOLD=abc 时，
+        # 真实 decide_after_intent 会抛 IntentClassifierError；
+        # Eval 必须记为失败案例并输出汇总，而不是崩溃。
+        import io
+        from contextlib import redirect_stdout
+
+        cases = [("退款流程是什么", "refund_after_sales", "allow")]
+
+        def classifier(query):
+            return {"intent": "refund_after_sales", "confidence": 0.9, "reason": "r"}
+
+        buffer = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ, {"INTENT_CONFIDENCE_THRESHOLD": "abc"}
+            ),
+            redirect_stdout(buffer),
+        ):
+            exit_code = eval_module.run_evaluation(classify_fn=classifier, cases=cases)
+        captured = buffer.getvalue()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("gate error", captured)
+        self.assertIn("final=blocked_intent_classifier_error", captured)
+        # 汇总行仍然打印（未崩溃）。
+        self.assertIn("accuracy:", captured)
 
     def test_low_confidence_refund_fails_production_gate_check(self):
         # 复现评审场景：intent=refund_after_sales 但 confidence=0.1。

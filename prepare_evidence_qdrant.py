@@ -170,6 +170,13 @@ def _find_invalid_candidate(
                 f"{prefix}: retrieve_score is not a number "
                 f"({retrieve_score!r})"
             )
+        # NaN / Infinity 属于损坏的检索分数：判为非法候选，
+        # 否则会写入 JSON 输出（非标准值破坏下游严格解析器）。
+        if not math.isfinite(float(retrieve_score)):
+            return (
+                f"{prefix}: retrieve_score is not finite "
+                f"({retrieve_score!r})"
+            )
 
         record = item.get("record")
         if not isinstance(record, dict):

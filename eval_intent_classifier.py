@@ -82,7 +82,17 @@ def evaluate_case(
             "ok": False,
         }
 
-    decision_status, _decision_reason = gate_fn(result)
+    # 门控函数与分类一样属于“可能失败的外部调用”（如
+    # INTENT_CONFIDENCE_THRESHOLD 配置非法时 decide_after_intent 抛
+    # IntentClassifierError）：按约定必须记为失败案例并继续汇总，
+    # 而不是让整个 Eval 崩溃。
+    try:
+        decision_status, _decision_reason = gate_fn(result)
+        gate_error: str | None = None
+    except IntentClassifierError as exc:
+        decision_status = "blocked_intent_classifier_error"
+        gate_error = str(exc)
+
     final_status = decision_status if decision_status else ALLOWED_SENTINEL
 
     label_ok = returned_intent == expected_intent
@@ -94,6 +104,8 @@ def evaluate_case(
         mismatches.append("label mismatch")
     if not gate_ok:
         mismatches.append("gate mismatch")
+    if gate_error is not None:
+        mismatches.append(f"gate error: {gate_error}")
 
     return {
         "query": query,
