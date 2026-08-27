@@ -39,15 +39,34 @@ TOP_K_RERANK = 3
 DEFAULT_MIN_RERANK_SCORE = 0.75
 
 
+class EvidenceGateConfigError(ValueError):
+    """Evidence Gate 配置（如 MIN_RERANK_SCORE）非法。"""
+
+
 def get_min_rerank_score() -> float:
     """Reranker 分数阈值（环境变量 MIN_RERANK_SCORE 可覆盖，默认 0.75）。
 
+    必须是有限数字：NaN / inf / 非法字符串一律抛出
+    ``EvidenceGateConfigError``，配置错误一律 fail closed。
+    空白值视同未设置。
     注意：默认值未经评测确定，不是可靠阈值，调参前请先做检索评测。
     """
     raw = os.environ.get("MIN_RERANK_SCORE")
-    if not raw:
+    if not raw or not raw.strip():
         return DEFAULT_MIN_RERANK_SCORE
-    return float(raw)
+
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise EvidenceGateConfigError(
+            f"Invalid MIN_RERANK_SCORE: {raw!r}"
+        ) from exc
+
+    if not math.isfinite(value):
+        raise EvidenceGateConfigError(
+            f"MIN_RERANK_SCORE must be a finite number: {raw!r}"
+        )
+    return value
 
 
 def build_evidence_bundle(
@@ -124,6 +143,8 @@ def evaluate_evidence(
     """Evidence Gate 二次校验（独立函数，不混入 Citation Validator）。
 
     至少检查：
+    - 阈值配置是否为有限数字（非法时 fail closed，
+      新增状态 ``blocked_evidence_gate_config_error``）；
     - 是否存在候选证据；
     - 每条证据的 platform 是否等于 requested_platform；
     - 最高 rerank 分数是否达到阈值（get_min_rerank_score）；
@@ -132,15 +153,31 @@ def evaluate_evidence(
     返回 ``(status, reason, evidence, gate_info)``；
     blocked 状态下 evidence 恒为 []，gate_info["passed"] 为 False。
     """
+    # 配置校验最先执行：阈值非法时拒绝给出任何“通过”结论。
+    try:
+        min_score = get_min_rerank_score()
+        config_error: str | None = None
+    except EvidenceGateConfigError as exc:
+        min_score = None
+        config_error = str(exc)
+
     scores = [float(item["rerank_score"]) for item in reranked_candidates]
     finite_scores = [score for score in scores if math.isfinite(score)]
 
     gate_info: dict[str, object] = {
         "passed": False,
-        "min_rerank_score": get_min_rerank_score(),
+        "min_rerank_score": min_score,
         "checked_candidates": len(reranked_candidates),
         "top_rerank_score": max(finite_scores) if finite_scores else None,
     }
+
+    if config_error is not None:
+        return (
+            "blocked_evidence_gate_config_error",
+            f"Evidence gate misconfigured: {config_error}",
+            [],
+            gate_info,
+        )
 
     if not reranked_candidates:
         return (
@@ -177,7 +214,6 @@ def evaluate_evidence(
             gate_info,
         )
 
-    min_score = float(gate_info["min_rerank_score"])
     top_score = float(gate_info["top_rerank_score"])  # type: ignore[arg-type]
     if top_score < min_score:
         return (
@@ -231,6 +267,12 @@ def retrieve_and_rank(
     只有平台门控与意图分类都通过后才会被调用，因此冲突 / 缺失 /
     无关 / 不确定的场景不会加载 Embedding 模型、
     也不会访问 Qdrant 或 Reranker。
+
+    边界行为：
+    - 零候选：在加载 Reranker 之前直接返回 ``[]``，
+      由 Evidence Gate 给出正式状态（blocked_no_matching_source）；
+    - 跨平台候选：不再抛异常，原样交给 Evidence Gate
+      判定为 blocked_platform_evidence_mismatch。
     """
     import torch
     from qdrant_client import QdrantClient, models
@@ -276,11 +318,10 @@ def retrieve_and_rank(
         for rank, point in enumerate(points, start=1)
     ]
 
-    if any(
-        item["record"]["platform"] != requested_platform
-        for item in candidates
-    ):
-        raise RuntimeError("Qdrant platform filter was violated")
+    # 零候选：不加载 Reranker、不调用 Tokenizer，直接返回空列表，
+    # 让 Evidence Gate 生成正式的 blocked_no_matching_source。
+    if not candidates:
+        return []
 
     rerank_tokenizer = AutoTokenizer.from_pretrained(RERANKER_ID)
     reranker = AutoModelForSequenceClassification.from_pretrained(RERANKER_ID)
@@ -321,6 +362,23 @@ def write_and_print(bundle: dict[str, object]) -> None:
         encoding="utf-8",
     )
     print(json.dumps(bundle, ensure_ascii=False, indent=2))
+
+
+def emit_intent_classifier_error(
+    query: str,
+    gate: dict[str, object],
+    exc: IntentClassifierError,
+) -> None:
+    """写出意图分类失败的 blocked 证据包并打印。"""
+    write_and_print(
+        build_evidence_bundle(
+            query=query,
+            status="blocked_intent_classifier_error",
+            reason=f"Intent classifier failed: {exc}",
+            requested_platform=gate["requested_platform"],
+            entry_platform=gate["entry_platform"],
+        )
+    )
 
 
 def main() -> None:
@@ -368,19 +426,17 @@ def main() -> None:
     try:
         intent_result = classify_intent(query)
     except IntentClassifierError as exc:
-        write_and_print(
-            build_evidence_bundle(
-                query=query,
-                status="blocked_intent_classifier_error",
-                reason=f"Intent classifier failed: {exc}",
-                requested_platform=requested_platform,
-                entry_platform=gate["entry_platform"],
-            )
-        )
+        emit_intent_classifier_error(query, gate, exc)
         return
 
     # 第 3 步：意图决策；unrelated / uncertain / 低置信度都在此拦截。
-    intent_status, intent_reason = decide_after_intent(intent_result)
+    # 意图阈值配置非法（如 INTENT_CONFIDENCE_THRESHOLD=abc）同样
+    # 属于分类器侧错误，必须转为 blocked 状态而不是崩溃。
+    try:
+        intent_status, intent_reason = decide_after_intent(intent_result)
+    except IntentClassifierError as exc:
+        emit_intent_classifier_error(query, gate, exc)
+        return
     if intent_status is not None:
         write_and_print(
             build_evidence_bundle(

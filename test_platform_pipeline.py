@@ -13,6 +13,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
+import eval_intent_classifier as eval_module
 import intent_classifier
 import prepare_evidence_qdrant as peq
 from intent_classifier import IntentClassifierError
@@ -494,11 +497,311 @@ class AnswerScriptRoutingTests(unittest.TestCase):
             "blocked_platform_evidence_mismatch",
             "blocked_no_matching_source",
             "blocked_intent_classifier_error",
+            "blocked_evidence_gate_config_error",
         ):
             with self.subTest(status=status):
                 # 这些状态必须走 “Evidence gate blocked” 的报错路径，
                 # 而不是出现在友好话术映射里。
                 self.assertNotIn(f'"{status}"', source.split("FRIENDLY_BLOCKED_ANSWERS = {")[1].split("}")[0])
+
+
+class ThresholdConfigTests(unittest.TestCase):
+    """REVIEW_bdaac5d P1-1：两个阈值必须是有限数字，配置错误 fail closed。"""
+
+    def test_min_rerank_score_rejects_non_finite_and_garbage(self):
+        for raw in ("nan", "NaN", "inf", "-inf", "Infinity", "abc"):
+            with self.subTest(raw=raw):
+                with mock.patch.dict(os.environ, {"MIN_RERANK_SCORE": raw}):
+                    with self.assertRaises(peq.EvidenceGateConfigError):
+                        peq.get_min_rerank_score()
+
+    def test_min_rerank_error_is_value_error(self):
+        # EvidenceGateConfigError 继承 ValueError，保持 try/except 兼容。
+        self.assertTrue(
+            issubclass(peq.EvidenceGateConfigError, ValueError)
+        )
+
+    def test_min_rerank_score_default_valid_and_blank(self):
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "MIN_RERANK_SCORE"
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                peq.get_min_rerank_score(), peq.DEFAULT_MIN_RERANK_SCORE
+            )
+        with mock.patch.dict(os.environ, {"MIN_RERANK_SCORE": "   "}):
+            # 空白值视同未设置。
+            self.assertEqual(
+                peq.get_min_rerank_score(), peq.DEFAULT_MIN_RERANK_SCORE
+            )
+        with mock.patch.dict(os.environ, {"MIN_RERANK_SCORE": "0.9"}):
+            self.assertEqual(peq.get_min_rerank_score(), 0.9)
+
+    def test_intent_threshold_rejects_non_finite_and_garbage(self):
+        for raw in ("nan", "inf", "-inf", "abc"):
+            with self.subTest(raw=raw):
+                with mock.patch.dict(
+                    os.environ, {"INTENT_CONFIDENCE_THRESHOLD": raw}
+                ):
+                    with self.assertRaises(IntentClassifierError):
+                        intent_classifier.get_intent_confidence_threshold()
+
+    def test_intent_threshold_range_and_default(self):
+        get = intent_classifier.get_intent_confidence_threshold
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "INTENT_CONFIDENCE_THRESHOLD"
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                get(), intent_classifier.DEFAULT_INTENT_CONFIDENCE_THRESHOLD
+            )
+        with mock.patch.dict(os.environ, {"INTENT_CONFIDENCE_THRESHOLD": "0.6"}):
+            self.assertEqual(get(), 0.6)
+        with mock.patch.dict(os.environ, {"INTENT_CONFIDENCE_THRESHOLD": "1.5"}):
+            with self.assertRaises(IntentClassifierError):
+                get()
+
+
+class EvaluateEvidenceConfigTests(unittest.TestCase):
+    """REVIEW_bdaac5d P1-1 回归：阈值非法时证据门必须 fail closed。"""
+
+    def evaluate_with_env(self, raw_threshold: str):
+        candidates = [make_candidate("aliexpress", 6.0, "a-perfect")]
+        with mock.patch.dict(os.environ, {"MIN_RERANK_SCORE": raw_threshold}):
+            return peq.evaluate_evidence("aliexpress", candidates)
+
+    def test_nan_threshold_fail_closed_not_ready(self):
+        status, reason, evidence, gate = self.evaluate_with_env("nan")
+        self.assertNotEqual(status, "ready_for_grounding")
+        self.assertEqual(status, "blocked_evidence_gate_config_error")
+        self.assertEqual(evidence, [])
+        self.assertFalse(gate["passed"])
+        self.assertIsNone(gate["min_rerank_score"])
+
+    def test_garbage_threshold_no_exception_escapes(self):
+        status, _, evidence, gate = self.evaluate_with_env("abc")
+        self.assertEqual(status, "blocked_evidence_gate_config_error")
+        self.assertEqual(evidence, [])
+        self.assertFalse(gate["passed"])
+
+
+def make_point(platform: str, chunk_id: str, retrieve_score: float) -> mock.Mock:
+    """构造一个 Qdrant ScoredPoint 形状的假对象。"""
+    point = mock.Mock()
+    point.payload = {
+        "chunk_id": chunk_id,
+        "source_id": f"{chunk_id}:src-hash",
+        "document_id": chunk_id,
+        "platform": platform,
+        "headings": ["标题"],
+        "text": "示例证据文本",
+        "contextualized_text": "示例上下文文本",
+    }
+    point.score = retrieve_score
+    return point
+
+
+class RetrieveRealBoundaryTests(unittest.TestCase):
+    """真实跑通 retrieve_and_rank（只 Mock 底层客户端/模型）。
+
+    REVIEW_bdaac5d P1-2 / P1-3：不再用 Mock 整个
+    ``retrieve_and_rank()`` 掩盖“零候选”与“跨平台”的真实边界。
+    """
+
+    QUERY = "退款流程是什么"
+    PLATFORM = "aliexpress"
+
+    def install_fake_stack(
+        self,
+        points: list[mock.Mock],
+        rerank_scores: list[float],
+    ) -> dict[str, mock.Mock]:
+        torch_mod = mock.MagicMock(name="torch")
+        qdrant_mod = mock.MagicMock(name="qdrant_client")
+        st_mod = mock.MagicMock(name="sentence_transformers")
+        tf_mod = mock.MagicMock(name="transformers")
+
+        client_instance = qdrant_mod.QdrantClient.return_value
+        client_instance.query_points.return_value.points = points
+
+        st_model = st_mod.SentenceTransformer.return_value
+        st_model.encode.return_value = np.zeros((1, 4), dtype=np.float32)
+
+        reranker_instance = (
+            tf_mod.AutoModelForSequenceClassification.from_pretrained.return_value
+        )
+        reranker_instance.return_value.logits.view.return_value.float.return_value.tolist.return_value = list(
+            rerank_scores
+        )
+
+        return {
+            "torch": torch_mod,
+            "qdrant_client": qdrant_mod,
+            "sentence_transformers": st_mod,
+            "transformers": tf_mod,
+        }
+
+    def call_real_retrieval(self, modules: dict[str, mock.Mock]):
+        manifest_mock = mock.Mock()
+        manifest_mock.read_text.return_value = json.dumps(
+            {"model_id": "fake-model"}
+        )
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(peq, "MANIFEST_PATH", manifest_mock),
+        ):
+            return peq.retrieve_and_rank(self.QUERY, self.PLATFORM)
+
+    def run_main_with_fake_stack(
+        self,
+        points: list[mock.Mock],
+        rerank_scores: list[float],
+    ) -> tuple[dict, mock.Mock]:
+        modules = self.install_fake_stack(points, rerank_scores)
+        manifest_mock = mock.Mock()
+        manifest_mock.read_text.return_value = json.dumps(
+            {"model_id": "fake-model"}
+        )
+        full_argv = ["prepare_evidence_qdrant.py", *ALIEXPRESS_QUERY_OK]
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(peq, "MANIFEST_PATH", manifest_mock),
+            mock.patch.object(peq, "classify_intent") as classify_mock,
+            # 注意：retrieve_and_rank 保持真实，仅底层库被替换。
+            mock.patch.object(peq, "OUTPUT_PATH") as output_path_mock,
+            mock.patch.object(sys, "argv", full_argv),
+        ):
+            classify_mock.return_value = GOOD_INTENT
+            peq.main()
+        bundle = json.loads(output_path_mock.write_text.call_args.args[0])
+        return bundle, modules["transformers"]
+
+    def test_zero_candidates_direct_call_returns_empty_without_models(self):
+        modules = self.install_fake_stack(points=[], rerank_scores=[])
+        result = self.call_real_retrieval(modules)
+        self.assertEqual(result, [])
+        tf_mod = modules["transformers"]
+        tf_mod.AutoTokenizer.from_pretrained.assert_not_called()
+        tf_mod.AutoModelForSequenceClassification.from_pretrained.assert_not_called()
+
+    def test_zero_candidates_full_pipeline_no_matching_source(self):
+        bundle, _ = self.run_main_with_fake_stack(points=[], rerank_scores=[])
+        self.assertEqual(bundle["status"], "blocked_no_matching_source")
+        self.assertEqual(bundle["evidence"], [])
+        self.assertFalse(bundle["evidence_gate"]["passed"])
+
+    def test_p1_3_cross_platform_candidate_reaches_gate(self):
+        # 直接调用：跨平台候选不再抛 RuntimeError，而是返回给调用方。
+        modules = self.install_fake_stack(
+            points=[make_point("temu", "t-cross", 0.9)],
+            rerank_scores=[6.5],
+        )
+        result = self.call_real_retrieval(modules)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["record"]["platform"], "temu")
+
+    def test_cross_platform_full_pipeline_yields_mismatch_bundle(self):
+        bundle, tf_mod = self.run_main_with_fake_stack(
+            points=[make_point("temu", "t-cross", 0.9)],
+            rerank_scores=[6.5],
+        )
+        self.assertEqual(
+            bundle["status"], "blocked_platform_evidence_mismatch"
+        )
+        self.assertEqual(bundle["evidence"], [])
+        # Reranker 真实被加载和调用，证明候选穿过了整条检索链路。
+        tf_mod.AutoModelForSequenceClassification.from_pretrained.assert_called()
+
+    def test_normal_flow_real_stack_still_ready(self):
+        points = [
+            make_point("aliexpress", "a-hi", 0.91),
+            make_point("aliexpress", "a-lo", 0.80),
+        ]
+        bundle, _ = self.run_main_with_fake_stack(
+            points=points, rerank_scores=[6.5, 3.0]
+        )
+        self.assertEqual(bundle["status"], "ready_for_grounding")
+        platforms = {item["platform"] for item in bundle["evidence"]}
+        self.assertEqual(platforms, {"aliexpress"})
+        # 按重排分数降序，最高分在前。
+        self.assertEqual(bundle["evidence"][0]["chunk_id"], "a-hi")
+
+
+class IntentThresholdPipelineTests(unittest.TestCase):
+    """REVIEW_bdaac5d P2-4：非法意图阈值必须转为 blocked 状态。"""
+
+    def test_invalid_intent_threshold_maps_to_classifier_error(self):
+        full_argv = ["prepare_evidence_qdrant.py", *ALIEXPRESS_QUERY_OK]
+        with (
+            mock.patch.object(peq, "classify_intent") as classify_mock,
+            mock.patch.object(peq, "retrieve_and_rank") as retrieve_mock,
+            mock.patch.object(peq, "OUTPUT_PATH") as output_path_mock,
+            mock.patch.dict(
+                os.environ, {"INTENT_CONFIDENCE_THRESHOLD": "abc"}
+            ),
+            mock.patch.object(sys, "argv", full_argv),
+        ):
+            classify_mock.return_value = GOOD_INTENT
+            peq.main()
+        retrieve_mock.assert_not_called()
+        bundle = json.loads(output_path_mock.write_text.call_args.args[0])
+        self.assertEqual(bundle["status"], "blocked_intent_classifier_error")
+        self.assertEqual(bundle["evidence"], [])
+
+
+class EvalScriptTests(unittest.TestCase):
+    """REVIEW_bdaac5d P2-5：在线评测脚本（离线只测其统计逻辑）。"""
+
+    def test_missing_key_skips_without_network_or_classifier(self):
+        # 不注入分类器走默认路径：无 Key 时必须跳过且不触网。
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "DEEPSEEK_API_KEY"
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(eval_module, "classify_intent") as clf_mock,
+        ):
+            exit_code = eval_module.run_evaluation()
+        self.assertEqual(exit_code, 0)
+        clf_mock.assert_not_called()
+
+    def test_injected_perfect_classifier_passes(self):
+        cases = [("a", "refund_after_sales"), ("b", "unrelated")]
+
+        def classifier(query):
+            intent = "refund_after_sales" if query == "a" else "unrelated"
+            return {"intent": intent, "confidence": 0.9, "reason": "r"}
+
+        exit_code = eval_module.run_evaluation(
+            classify_fn=classifier, cases=cases
+        )
+        self.assertEqual(exit_code, 0)
+
+    def test_mismatch_counts_as_failure(self):
+        def wrong(query):
+            return {"intent": "unrelated", "confidence": 0.9, "reason": "r"}
+
+        exit_code = eval_module.run_evaluation(
+            classify_fn=wrong,
+            cases=[("退款流程是什么", "refund_after_sales")],
+        )
+        self.assertEqual(exit_code, 1)
+
+    def test_classifier_error_counts_as_failure(self):
+        def broken(query):
+            raise IntentClassifierError("boom")
+
+        exit_code = eval_module.run_evaluation(
+            classify_fn=broken,
+            cases=[("退款流程是什么", "refund_after_sales")],
+        )
+        self.assertEqual(exit_code, 1)
 
 
 if __name__ == "__main__":

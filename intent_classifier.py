@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from typing import Any
@@ -52,9 +53,13 @@ def get_intent_model() -> str:
 
 
 def get_intent_confidence_threshold() -> float:
-    """置信度阈值（环境变量 INTENT_CONFIDENCE_THRESHOLD 可覆盖，默认 0.8）。"""
+    """置信度阈值（环境变量 INTENT_CONFIDENCE_THRESHOLD 可覆盖，默认 0.8）。
+
+    必须是 0~1 之间的有限数字：NaN / inf / 非法字符串一律抛出
+    ``IntentClassifierError``，配置错误一律 fail closed。空白值视同未设置。
+    """
     raw = os.environ.get("INTENT_CONFIDENCE_THRESHOLD")
-    if not raw:
+    if not raw or not raw.strip():
         return DEFAULT_INTENT_CONFIDENCE_THRESHOLD
 
     try:
@@ -63,6 +68,11 @@ def get_intent_confidence_threshold() -> float:
         raise IntentClassifierError(
             f"Invalid INTENT_CONFIDENCE_THRESHOLD: {raw!r}"
         ) from exc
+
+    if not math.isfinite(value):
+        raise IntentClassifierError(
+            f"INTENT_CONFIDENCE_THRESHOLD must be a finite number: {raw!r}"
+        )
 
     if not 0.0 <= value <= 1.0:
         raise IntentClassifierError(
