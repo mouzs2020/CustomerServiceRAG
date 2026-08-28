@@ -14,14 +14,18 @@ import argparse
 import json
 import math
 import os
+import sys
 from pathlib import Path
 
-from intent_classifier import (
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from customer_service_rag.intent_classifier import (
     IntentClassifierError,
     classify_intent,
     get_intent_confidence_threshold,
 )
-from platform_gate import resolve_platform
+from customer_service_rag.platform_gate import resolve_platform
 
 
 QDRANT_PATH = "output/qdrant_storage"

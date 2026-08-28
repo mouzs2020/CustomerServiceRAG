@@ -6,13 +6,21 @@ blocked_unrelated_question）已迁移到 DeepSeek 意图分类器
 因此只要能确定唯一平台，任意问题都会 ``platform_resolved`` 放行。
 
 运行方式：
-    python -m unittest test_platform_gate -v
+    python -m unittest tests.unit.test_platform_gate -v
 """
 
+import sys
 import unittest
+from pathlib import Path
 
-from acceptance_platform import CASES
-from platform_gate import detect_platforms_in_query, resolve_platform
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from customer_service_rag.platform_gate import (
+    detect_platforms_in_query,
+    resolve_platform,
+)
+from evaluation.acceptance_platform import CASES
 
 
 class ResolvePlatformTests(unittest.TestCase):

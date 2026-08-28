@@ -1,8 +1,8 @@
 """P0 测试清单：确定性逻辑 unittest+Mock，真实依赖显式标记并按需跳过。
 
 运行方式：
-    python test_p0_checklist.py                 # 输出六列报告表
-    python -m unittest test_p0_checklist -v     # 纳入常规测试发现
+    python -m tests.acceptance.test_p0_checklist # 输出六列报告表
+    python -m unittest tests.acceptance.test_p0_checklist -v
 
 层级与开关约定：
 - unit / unit+mock           —— 确定性逻辑或仅 Mock 底层库；
@@ -39,16 +39,27 @@ from unittest import mock
 import httpx
 import numpy as np
 
-import intent_classifier
-import platform_gate
-import prepare_evidence_qdrant as peq
-from intent_classifier import IntentClassifierError
-from platform_gate import UNRELATED_FALLBACK, UNCERTAIN_FALLBACK
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from customer_service_rag import intent_classifier
+from customer_service_rag import platform_gate
+from customer_service_rag import prepare_evidence_qdrant as peq
+from customer_service_rag.intent_classifier import IntentClassifierError
+from customer_service_rag.platform_gate import (
+    UNRELATED_FALLBACK,
+    UNCERTAIN_FALLBACK,
+)
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = PROJECT_ROOT
 FIXTURE_PATH = PROJECT_DIR / "tests" / "fixtures" / "p0_candidates.json"
-ANSWER_SOURCE_PATH = PROJECT_DIR / "answer_with_citations_qdrant.py"
+ANSWER_SOURCE_PATH = (
+    PROJECT_DIR
+    / "src"
+    / "customer_service_rag"
+    / "answer_with_citations_qdrant.py"
+)
 ANSWER_SOURCE_TEXT = ANSWER_SOURCE_PATH.read_text(encoding="utf-8")
 INDEX_DIR = PROJECT_DIR / "output"
 

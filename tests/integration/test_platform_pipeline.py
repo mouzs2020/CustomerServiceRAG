@@ -15,10 +15,13 @@ from unittest import mock
 
 import numpy as np
 
-import eval_intent_classifier as eval_module
-import intent_classifier
-import prepare_evidence_qdrant as peq
-from intent_classifier import IntentClassifierError
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+import evaluation.eval_intent_classifier as eval_module
+from customer_service_rag import intent_classifier
+from customer_service_rag import prepare_evidence_qdrant as peq
+from customer_service_rag.intent_classifier import IntentClassifierError
 
 
 ALIEXPRESS_QUERY_OK = ["退款流程是什么", "--user-platform", "aliexpress"]
@@ -475,7 +478,12 @@ class AnswerScriptRoutingTests(unittest.TestCase):
     避免任何副作用。
     """
 
-    SOURCE_PATH = Path(__file__).resolve().parent / "answer_with_citations_qdrant.py"
+    SOURCE_PATH = (
+        PROJECT_ROOT
+        / "src"
+        / "customer_service_rag"
+        / "answer_with_citations_qdrant.py"
+    )
 
     def get_source(self) -> str:
         return self.SOURCE_PATH.read_text(encoding="utf-8")
@@ -484,7 +492,7 @@ class AnswerScriptRoutingTests(unittest.TestCase):
         source = self.get_source()
         # 导入两个固定话术并用字典映射两个友好 blocked 状态。
         self.assertIn(
-            "from platform_gate import UNRELATED_FALLBACK, UNCERTAIN_FALLBACK",
+            "from customer_service_rag.platform_gate import (",
             source,
         )
         self.assertIn('"blocked_unrelated_question": UNRELATED_FALLBACK', source)

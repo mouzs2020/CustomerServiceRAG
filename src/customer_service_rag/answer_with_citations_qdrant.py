@@ -1,11 +1,18 @@
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 import httpx
 
-from platform_gate import UNRELATED_FALLBACK, UNCERTAIN_FALLBACK
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from customer_service_rag.platform_gate import (
+    UNRELATED_FALLBACK,
+    UNCERTAIN_FALLBACK,
+)
 
 
 BUNDLE_PATH = Path("output/evidence_bundle_qdrant.json")

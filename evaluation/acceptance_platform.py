@@ -1,7 +1,7 @@
 """验收案例：验证确定性平台门控（resolve_platform）的规则。
 
 运行方式：
-    python acceptance_platform.py
+    python -m evaluation.acceptance_platform
 
 该脚本只测试纯逻辑（platform_gate），不加载向量模型、不访问网络。
 
@@ -11,7 +11,13 @@
 （见 test_platform_pipeline.py 与 intent_classifier.py）。
 """
 
-from platform_gate import resolve_platform
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from customer_service_rag.platform_gate import resolve_platform
 
 
 CASES = [

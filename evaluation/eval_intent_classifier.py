@@ -14,7 +14,7 @@
 DEEPSEEK_API_KEY 并产生真实 API 调用。
 
 用法：
-    python eval_intent_classifier.py
+    python -m evaluation.eval_intent_classifier
 
 退出码约定：
     0 —— 跳过，或全部案例在两个层面都一致且无调用错误；
@@ -24,10 +24,17 @@ DEEPSEEK_API_KEY 并产生真实 API 调用。
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Any, Callable
 
-from intent_classifier import IntentClassifierError, classify_intent
-from prepare_evidence_qdrant import decide_after_intent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from customer_service_rag.intent_classifier import (
+    IntentClassifierError,
+    classify_intent,
+)
+from customer_service_rag.prepare_evidence_qdrant import decide_after_intent
 
 
 # 门控决策函数签名：输入意图分类结果，返回 (status|None, reason)；
