@@ -446,20 +446,102 @@ def write_and_print(bundle: dict[str, object]) -> None:
     print(json.dumps(bundle, ensure_ascii=False, indent=2))
 
 
-def emit_intent_classifier_error(
+def prepare_evidence(
     query: str,
-    gate: dict[str, object],
-    exc: IntentClassifierError,
-) -> None:
-    """写出意图分类失败的 blocked 证据包并打印。"""
-    write_and_print(
-        build_evidence_bundle(
+    entry_platform: str | None,
+    *,
+    classify=None,
+    retrieve=None,
+) -> dict[str, object]:
+    """纯内存证据包生成：供 Web 服务直接调用，不做任何文件 I/O。
+
+    流程：Platform Gate → Intent Classifier → decide_after_intent
+    → retrieve_and_rank → evaluate_evidence → build_evidence_bundle。
+
+    - classify / retrieve 为可选依赖注入；未传入时在函数执行时才
+      取用模块级 ``classify_intent`` / ``retrieve_and_rank``（晚绑定，
+      不固化为参数默认值），便于测试替换。
+    - 阻断语义与原 CLI 一致：平台门控失败不触达 classify/retrieve；
+      classifier 失败转为 blocked_intent_classifier_error；
+      unrelated / uncertain / 低置信度不调用 retrieve；
+      Evidence Gate 状态与证据结构保持不变。
+    - Qdrant / Embedding / Reranker 等基础设施异常原样向上抛出，
+      不新增 blocked 状态、不吞异常。
+    """
+    if classify is None:
+        classify = classify_intent
+    if retrieve is None:
+        retrieve = retrieve_and_rank
+
+    # 第 1 步：确定性平台门控（blocked 时不会触发意图分类和检索）。
+    gate = resolve_platform(query, entry_platform)
+
+    if gate["status"] != "platform_resolved":
+        return build_evidence_bundle(
+            query=query,
+            status=str(gate["status"]),
+            reason=str(gate["reason"]),
+            requested_platform=gate["requested_platform"],
+            entry_platform=gate["entry_platform"],
+        )
+
+    requested_platform = gate["requested_platform"]
+
+    # 第 2 步：意图分类；失败属于 blocked_intent_classifier_error。
+    try:
+        intent_result = classify(query)
+    except IntentClassifierError as exc:
+        return build_evidence_bundle(
             query=query,
             status="blocked_intent_classifier_error",
             reason=f"Intent classifier failed: {exc}",
             requested_platform=gate["requested_platform"],
             entry_platform=gate["entry_platform"],
         )
+
+    # 第 3 步：意图决策；unrelated / uncertain / 低置信度都在此拦截。
+    # 意图阈值配置非法（如 INTENT_CONFIDENCE_THRESHOLD=abc）同样
+    # 属于分类器侧错误，必须转为 blocked 状态而不是崩溃。
+    # 注意：与旧实现一致，此处不传 intent_result，
+    # 意图三字段保持 null。
+    try:
+        intent_status, intent_reason = decide_after_intent(intent_result)
+    except IntentClassifierError as exc:
+        return build_evidence_bundle(
+            query=query,
+            status="blocked_intent_classifier_error",
+            reason=f"Intent classifier failed: {exc}",
+            requested_platform=requested_platform,
+            entry_platform=gate["entry_platform"],
+        )
+    if intent_status is not None:
+        return build_evidence_bundle(
+            query=query,
+            status=intent_status,
+            reason=intent_reason,
+            requested_platform=requested_platform,
+            entry_platform=gate["entry_platform"],
+            intent_result=intent_result,
+        )
+
+    # 第 4 步：检索 + 重排（Qdrant 平台过滤 + BGE Reranker）。
+    all_reranked = retrieve(query, requested_platform)
+
+    # 第 5 步：Evidence Gate 二次校验。
+    evidence_status, evidence_reason, evidence, gate_info = evaluate_evidence(
+        requested_platform,
+        all_reranked,
+    )
+
+    return build_evidence_bundle(
+        query=query,
+        status=evidence_status,
+        reason=evidence_reason,
+        requested_platform=requested_platform,
+        entry_platform=gate["entry_platform"],
+        intent_result=intent_result,
+        evidence_gate=gate_info,
+        evidence=evidence,
     )
 
 
@@ -487,72 +569,9 @@ def main() -> None:
 
     query = " ".join(args.query)
 
-    # 第 1 步：确定性平台门控（blocked 时不会触发意图分类和检索）。
-    gate = resolve_platform(query, args.user_platform)
+    bundle = prepare_evidence(query, args.user_platform)
 
-    if gate["status"] != "platform_resolved":
-        write_and_print(
-            build_evidence_bundle(
-                query=query,
-                status=str(gate["status"]),
-                reason=str(gate["reason"]),
-                requested_platform=gate["requested_platform"],
-                entry_platform=gate["entry_platform"],
-            )
-        )
-        return
-
-    requested_platform = gate["requested_platform"]
-
-    # 第 2 步：DeepSeek 意图分类；失败属于 blocked_intent_classifier_error。
-    try:
-        intent_result = classify_intent(query)
-    except IntentClassifierError as exc:
-        emit_intent_classifier_error(query, gate, exc)
-        return
-
-    # 第 3 步：意图决策；unrelated / uncertain / 低置信度都在此拦截。
-    # 意图阈值配置非法（如 INTENT_CONFIDENCE_THRESHOLD=abc）同样
-    # 属于分类器侧错误，必须转为 blocked 状态而不是崩溃。
-    try:
-        intent_status, intent_reason = decide_after_intent(intent_result)
-    except IntentClassifierError as exc:
-        emit_intent_classifier_error(query, gate, exc)
-        return
-    if intent_status is not None:
-        write_and_print(
-            build_evidence_bundle(
-                query=query,
-                status=intent_status,
-                reason=intent_reason,
-                requested_platform=requested_platform,
-                entry_platform=gate["entry_platform"],
-                intent_result=intent_result,
-            )
-        )
-        return
-
-    # 第 4 步：检索 + 重排（Qdrant 平台过滤 + BGE Reranker）。
-    all_reranked = retrieve_and_rank(query, requested_platform)
-
-    # 第 5 步：Evidence Gate 二次校验。
-    evidence_status, evidence_reason, evidence, gate_info = evaluate_evidence(
-        requested_platform,
-        all_reranked,
-    )
-
-    write_and_print(
-        build_evidence_bundle(
-            query=query,
-            status=evidence_status,
-            reason=evidence_reason,
-            requested_platform=requested_platform,
-            entry_platform=gate["entry_platform"],
-            intent_result=intent_result,
-            evidence_gate=gate_info,
-            evidence=evidence,
-        )
-    )
+    write_and_print(bundle)
 
 
 if __name__ == "__main__":
