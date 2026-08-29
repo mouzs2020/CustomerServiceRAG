@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "customer-service-rag"
+version = "0.1.0"
+description = "Customer service RAG for AliExpress / Temu refund & after-sales rules"
+requires-python = ">=3.10"
+dependencies = [
+    "docling==2.121.0",
+    "transformers==5.15.1",
+    "torch==2.13.0",
+    "sentence-transformers==5.7.0",
+    "qdrant-client==1.19.0",
+    "httpx==0.28.1",
+    "numpy==2.2.6",
+    "pydantic==2.13.4",
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.52.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
