@@ -1,6 +1,8 @@
 """api.py 的 TestClient 单元测试（全 Mock，无真实外部服务、无文件 I/O）。"""
 
 import io
+import json
+import logging
 import os
 import sys
 import tempfile
@@ -19,8 +21,28 @@ from fastapi.testclient import TestClient
 
 from customer_service_rag import api
 from customer_service_rag.platform_gate import UNRELATED_FALLBACK
+from customer_service_rag.schemas import ReadinessResponse
 
 SENSITIVE_TEXT = "qdrant refused; key=sk-secret; upstream body"
+
+READY_CHECKS = ReadinessResponse(
+    status="ready",
+    checks={
+        "deepseek_api_key": True,
+        "embedding_manifest": True,
+        "qdrant_collection": True,
+        "dimension_match": True,
+    },
+)
+NOT_READY_CHECKS = ReadinessResponse(
+    status="not_ready",
+    checks={
+        "deepseek_api_key": False,
+        "embedding_manifest": False,
+        "qdrant_collection": False,
+        "dimension_match": False,
+    },
+)
 
 
 def make_evidence():
@@ -82,6 +104,14 @@ def runner_returning(builder):
         return builder(request_id_factory())
 
     return mock.Mock(side_effect=runner)
+
+
+def _checker_returning(result):
+    """构造 readiness 依赖的 override：FastAPI 调用 override 后，
+    注入的必须是可调用的 checker，由 checker 再返回结果。"""
+    def checker():
+        return result
+    return lambda: checker
 
 
 class ApiTestBase(unittest.TestCase):
@@ -273,6 +303,201 @@ class OpenApiContractTests(unittest.TestCase):
         health_ok = schema["paths"]["/health"]["get"]["responses"]["200"]
         self.assertIn("HealthResponse", schema["components"]["schemas"])
         self.assertIn("application/json", health_ok["content"])
+
+
+class ReadyEndpointTests(ApiTestBase):
+    def override_checker(self, result):
+        api.app.dependency_overrides[api.get_readiness_checker] = (
+            _checker_returning(result)
+        )
+
+    def test_ready_returns_200(self):
+        self.override_checker(READY_CHECKS)
+        response = self.client.get("/ready")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "ready")
+        self.assertTrue(all(body["checks"].values()))
+
+    def test_not_ready_returns_503(self):
+        self.override_checker(NOT_READY_CHECKS)
+        response = self.client.get("/ready")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["status"], "not_ready")
+
+    def test_ready_does_not_call_runner(self):
+        self.override_checker(READY_CHECKS)
+        self.client.get("/ready")
+        self.runner.assert_not_called()
+
+    def test_openapi_declares_ready_with_503_schema(self):
+        schema = api.app.openapi()
+        responses = schema["paths"]["/ready"]["get"]["responses"]
+        self.assertIn("200", responses)
+        self.assertIn("503", responses)
+        ref = responses["503"]["content"]["application/json"]["schema"]["$ref"]
+        self.assertTrue(ref.endswith("/ReadinessResponse"))
+
+
+class RequestIdHeaderTests(ApiTestBase):
+    def get_request_id(self, response):
+        return response.headers["X-Request-ID"]
+
+    def test_headers_on_health_ready_answer_422_502_503(self):
+        # 200（health）
+        self.assertIn("X-Request-ID", self.client.get("/health").headers)
+        # 200（ready）
+        api.app.dependency_overrides[api.get_readiness_checker] = (
+            _checker_returning(READY_CHECKS)
+        )
+        self.assertIn("X-Request-ID", self.client.get("/ready").headers)
+        # 200（answer）
+        self.runner = runner_returning(ready_response)
+        ok = self.post_answer(
+            {"query": "退款流程是什么", "entry_platform": "aliexpress"}
+        )
+        self.assertIn("X-Request-ID", ok.headers)
+        # 422
+        self.assertIn(
+            "X-Request-ID",
+            self.post_answer({"query": "", "entry_platform": "amazon"}).headers,
+        )
+        # 503
+        self.runner = mock.Mock(side_effect=RuntimeError(SENSITIVE_TEXT))
+        error_503 = self.post_answer(
+            {"query": "退款流程是什么", "entry_platform": "aliexpress"}
+        )
+        self.assertIn("X-Request-ID", error_503.headers)
+        # 502
+        self.runner = mock.Mock(side_effect=ValueError(SENSITIVE_TEXT))
+        error_502 = self.post_answer(
+            {"query": "退款流程是什么", "entry_platform": "aliexpress"}
+        )
+        self.assertIn("X-Request-ID", error_502.headers)
+        # 头部均为合法 UUID，且逐次不同
+        ids = [self.get_request_id(r) for r in (ok, error_503, error_502)]
+        for request_id in ids:
+            uuid.UUID(request_id)
+        self.assertEqual(len(set(ids)), len(ids))
+
+    def test_answer_request_id_matches_header(self):
+        self.runner = runner_returning(ready_response)
+        response = self.post_answer(
+            {"query": "退款流程是什么", "entry_platform": "aliexpress"}
+        )
+        self.assertEqual(
+            response.json()["request_id"],
+            self.get_request_id(response),
+        )
+
+    def test_error_request_id_matches_header(self):
+        self.runner = mock.Mock(side_effect=RuntimeError(SENSITIVE_TEXT))
+        response = self.post_answer(
+            {"query": "退款流程是什么", "entry_platform": "aliexpress"}
+        )
+        self.assertEqual(
+            response.json()["request_id"],
+            self.get_request_id(response),
+        )
+
+    def test_request_ids_differ_across_requests(self):
+        first = self.get_request_id(self.client.get("/health"))
+        second = self.get_request_id(self.client.get("/health"))
+        self.assertNotEqual(first, second)
+        uuid.UUID(first)
+        uuid.UUID(second)
+
+
+class StructuredLogTests(ApiTestBase):
+    REQUIRED_FIELDS = {
+        "request_id",
+        "method",
+        "path",
+        "status_code",
+        "duration_ms",
+    }
+
+    def capture_log(self, action):
+        with mock.patch.object(api.logger, "info") as log_mock:
+            action()
+        self.assertTrue(log_mock.called)
+        line = log_mock.call_args.args[0]
+        return line, json.loads(line)
+
+    def test_log_is_valid_json_with_exact_fields(self):
+        line, data = self.capture_log(lambda: self.client.get("/health"))
+        self.assertEqual(set(data), self.REQUIRED_FIELDS)
+        self.assertEqual(data["method"], "GET")
+        self.assertEqual(data["path"], "/health")
+        self.assertEqual(data["status_code"], 200)
+        self.assertGreaterEqual(data["duration_ms"], 0)
+        uuid.UUID(data["request_id"])
+        self.assertNotIn("\n", line)
+
+    def test_log_excludes_sensitive_content(self):
+        marker_query = "SECRET_QUERY_退款"
+        self.runner = mock.Mock(side_effect=RuntimeError(SENSITIVE_TEXT))
+        _, data = self.capture_log(
+            lambda: self.post_answer(
+                {"query": marker_query, "entry_platform": "aliexpress"}
+            )
+        )
+        line = json.dumps(data, ensure_ascii=False)
+        for marker in (marker_query, "sk-secret", "qdrant refused", "Evidence"):
+            self.assertNotIn(marker, line)
+
+    def test_unknown_exception_logs_500_and_returns_500(self):
+        self.runner = mock.Mock(side_effect=KeyError("boom-marker"))
+
+        def action():
+            with TestClient(api.app, raise_server_exceptions=False) as client:
+                return client.post(
+                    "/v1/answer",
+                    json={"query": "退款流程是什么", "entry_platform": "aliexpress"},
+                )
+
+        response_holder = {}
+        with mock.patch.object(api.logger, "info") as log_mock:
+            response_holder["response"] = action()
+        self.assertTrue(log_mock.called)
+        data = json.loads(log_mock.call_args.args[0])
+        self.assertEqual(set(data), self.REQUIRED_FIELDS)
+        self.assertEqual(data["status_code"], 500)
+        self.assertNotIn("boom-marker", json.dumps(data))
+        response = response_holder["response"]
+        self.assertEqual(response.status_code, 500)
+
+
+class LoggerConfigTests(ApiTestBase):
+    REQUIRED_FIELDS = {
+        "request_id",
+        "method",
+        "path",
+        "status_code",
+        "duration_ms",
+    }
+
+    def test_logger_deterministic_config(self):
+        self.assertTrue(api.logger.isEnabledFor(logging.INFO))
+        self.assertTrue(
+            any(
+                isinstance(handler, logging.StreamHandler)
+                for handler in api.logger.handlers
+            )
+        )
+        self.assertFalse(api.logger.propagate)
+
+    def test_each_request_logs_exactly_one_structured_line(self):
+        with mock.patch.object(api.logger, "info") as log_mock:
+            self.client.get("/health")
+            self.client.get("/health")
+        self.assertEqual(log_mock.call_count, 2)
+        request_ids = []
+        for call in log_mock.call_args_list:
+            data = json.loads(call.args[0])
+            self.assertEqual(set(data), self.REQUIRED_FIELDS)
+            request_ids.append(data["request_id"])
+        self.assertNotEqual(request_ids[0], request_ids[1])
 
 
 if __name__ == "__main__":

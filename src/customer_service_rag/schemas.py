@@ -143,6 +143,13 @@ class ApiErrorResponse(BaseModel):
     reason: str
 
 
+class ReadinessResponse(BaseModel):
+    """Readiness 检查结果：status 仅为 ready / not_ready，checks 为本地静态检查项。"""
+
+    status: Literal["ready", "not_ready"]
+    checks: dict[str, bool]
+
+
 __all__ = [
     "MAX_QUERY_LENGTH",
     "AnswerRequest",
@@ -155,4 +162,5 @@ __all__ = [
     "HealthResponse",
     "Intent",
     "Platform",
+    "ReadinessResponse",
 ]
