@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -121,13 +122,37 @@ class AnswerResponse(BaseModel):
     used_citations: list[str] = Field(default_factory=list)
 
 
+class ApiErrorCode(str, Enum):
+    """API 层错误码：仅允许映射层定义的两个值。"""
+
+    SERVICE_UNAVAILABLE = "service_unavailable"
+    INVALID_UPSTREAM_RESPONSE = "invalid_upstream_response"
+
+
+class HealthResponse(BaseModel):
+    """Liveness 存活检查：仅表示服务进程可用，不代表依赖已就绪。"""
+
+    status: Literal["ok"] = "ok"
+
+
+class ApiErrorResponse(BaseModel):
+    """HTTP 502 / 503 的安全错误响应，不携带异常原文或上游响应正文。"""
+
+    request_id: str
+    error_code: ApiErrorCode
+    reason: str
+
+
 __all__ = [
     "MAX_QUERY_LENGTH",
     "AnswerRequest",
     "AnswerResponse",
+    "ApiErrorCode",
+    "ApiErrorResponse",
     "BundleStatus",
     "EvidenceGateInfo",
     "EvidenceItem",
+    "HealthResponse",
     "Intent",
     "Platform",
 ]
