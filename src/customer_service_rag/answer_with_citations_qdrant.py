@@ -1,3 +1,15 @@
+"""证据包 -> DeepSeek 引用校验 -> 回答产物。
+
+重构说明：
+- ``generate_answer(bundle, *, post=None)`` 是纯内存函数，可被 Web 服务直接调用；
+  ``post`` 为可选依赖注入，未传入时才使用 ``httpx.post``（真实网络）。
+- 导入本模块零副作用：不读文件、不调用 DeepSeek、不打印、不触发 SystemExit。
+- 仅 ``main()`` 读取 BUNDLE_PATH、写 OUTPUT_PATH 并打印，命令行行为不变：
+  friendly 拦截写答案后 SystemExit(0)；非友好拦截 SystemExit 报错；
+  ready 缺 API Key 时 SystemExit；引用校验失败抛 ValueError；
+  DeepSeek HTTP 错误抛 RuntimeError；超时/畸形响应原样向上抛。
+"""
+
 import json
 import os
 import re
@@ -18,6 +30,7 @@ from customer_service_rag.platform_gate import (
 BUNDLE_PATH = Path("output/evidence_bundle_qdrant.json")
 OUTPUT_PATH = Path("output/answer_qdrant.json")
 FALLBACK = "证据不足，无法根据现有资料回答。"
+DEEPSEEK_CHAT_URL = "https://api.deepseek.com/chat/completions"
 
 # 固定提示：这两类 blocked 状态不调用回答模型，直接返回固定话术。
 FRIENDLY_BLOCKED_ANSWERS = {
@@ -25,57 +38,65 @@ FRIENDLY_BLOCKED_ANSWERS = {
     "blocked_intent_uncertain": UNCERTAIN_FALLBACK,
 }
 
-bundle = json.loads(
-    BUNDLE_PATH.read_text(encoding="utf-8")
-)
 
-friendly_answer = FRIENDLY_BLOCKED_ANSWERS.get(bundle["status"])
-
-if friendly_answer is not None:
-    answer = friendly_answer
-    result = {
-        "model": "fallback",
-        "query": bundle["query"],
+def _build_result(
+    model: str,
+    query: str,
+    answer: str,
+    used_citations: list[str],
+) -> dict[str, object]:
+    return {
+        "model": model,
+        "query": query,
         "answer": answer,
-        "used_citations": [],
+        "used_citations": used_citations,
     }
 
-    OUTPUT_PATH.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+
+def generate_answer(
+    bundle: dict[str, object],
+    *,
+    post=None,
+) -> dict[str, object]:
+    """根据证据包生成回答（纯内存，无文件 I/O）。
+
+    - friendly blocked（unrelated / uncertain）：固定话术，不调用 post；
+    - 其他非 ready 状态：抛 ValueError，不调用 DeepSeek；
+    - ready_for_grounding：构造 Prompt 调用 DeepSeek 并校验引用。
+    """
+    status = bundle.get("status")
+    query = bundle["query"]
+
+    friendly_answer = FRIENDLY_BLOCKED_ANSWERS.get(status)  # type: ignore[arg-type]
+    if friendly_answer is not None:
+        return _build_result("fallback", query, friendly_answer, [])
+
+    if status != "ready_for_grounding":
+        raise ValueError(f"Evidence gate blocked: {status}")
+
+    post_fn = post if post is not None else httpx.post
+
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY is not set")
+
+    model = os.environ.get(
+        "DEEPSEEK_MODEL",
+        "deepseek-v4-flash",
     )
 
-    print(answer)
-    print("\nused_citations: []")
-    print(f"saved: {OUTPUT_PATH}")
-    raise SystemExit(0)
+    evidence_blocks = []
 
-if bundle["status"] != "ready_for_grounding":
-    raise SystemExit(
-        f"Evidence gate blocked: {bundle['status']}"
-    )
+    for evidence in bundle["evidence"]:  # type: ignore[union-attr]
+        headings = " > ".join(evidence["headings"])
+        evidence_blocks.append(
+            f"[{evidence['citation_id']}]\n"
+            f"平台：{evidence['platform']}\n"
+            f"章节：{headings}\n"
+            f"原文：{evidence['text']}"
+        )
 
-api_key = os.environ.get("DEEPSEEK_API_KEY")
-if not api_key:
-    raise SystemExit("DEEPSEEK_API_KEY is not set")
-
-model = os.environ.get(
-    "DEEPSEEK_MODEL",
-    "deepseek-v4-flash",
-)
-
-evidence_blocks = []
-
-for evidence in bundle["evidence"]:
-    headings = " > ".join(evidence["headings"])
-    evidence_blocks.append(
-        f"[{evidence['citation_id']}]\n"
-        f"平台：{evidence['platform']}\n"
-        f"章节：{headings}\n"
-        f"原文：{evidence['text']}"
-    )
-
-system_prompt = f"""
+    system_prompt = f"""
 你是严格依据证据回答问题的 RAG 助手。
 
 规则：
@@ -87,64 +108,89 @@ system_prompt = f"""
 6. 只回答问题明确询问的范围，不主动补充未被询问的信息。
 """.strip()
 
-user_prompt = (
-    f"问题：{bundle['query']}\n\n"
-    "证据：\n"
-    + "\n\n".join(evidence_blocks)
-)
-
-response = httpx.post(
-    "https://api.deepseek.com/chat/completions",
-    headers={
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    },
-    json={
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "thinking": {"type": "disabled"},
-        "temperature": 0.1,
-        "max_tokens": 800,
-        "stream": False,
-    },
-    timeout=120,
-)
-
-if response.is_error:
-    raise RuntimeError(
-        f"DeepSeek API error {response.status_code}: "
-        f"{response.text}"
+    user_prompt = (
+        f"问题：{query}\n\n"
+        "证据：\n"
+        + "\n\n".join(evidence_blocks)
     )
 
-answer = response.json()["choices"][0]["message"]["content"].strip()
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
-allowed = {
-    evidence["citation_id"]
-    for evidence in bundle["evidence"]
-}
-used = set(re.findall(r"\[(E\d+)\]", answer))
+    response = post_fn(
+        DEEPSEEK_CHAT_URL,
+        headers=headers,
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "thinking": {"type": "disabled"},
+            "temperature": 0.1,
+            "max_tokens": 800,
+            "stream": False,
+        },
+        timeout=120,
+    )
 
-if used - allowed:
-    raise ValueError(f"Unknown citations: {used - allowed}")
+    if response.is_error:
+        raise RuntimeError(
+            f"DeepSeek API error {response.status_code}: "
+            f"{response.text}"
+        )
 
-if answer != FALLBACK and not used:
-    raise ValueError("Answer contains no citation")
+    answer = response.json()["choices"][0]["message"]["content"].strip()
 
-result = {
-    "model": model,
-    "query": bundle["query"],
-    "answer": answer,
-    "used_citations": sorted(used),
-}
+    allowed = {
+        evidence["citation_id"]
+        for evidence in bundle["evidence"]  # type: ignore[union-attr]
+    }
+    used = set(re.findall(r"\[(E\d+)\]", answer))
 
-OUTPUT_PATH.write_text(
-    json.dumps(result, ensure_ascii=False, indent=2),
-    encoding="utf-8",
-)
+    if used - allowed:
+        raise ValueError(f"Unknown citations: {used - allowed}")
 
-print(answer)
-print(f"\nused_citations: {sorted(used)}")
-print(f"saved: {OUTPUT_PATH}")
+    if answer != FALLBACK and not used:
+        raise ValueError("Answer contains no citation")
+
+    return _build_result(model, query, answer, sorted(used))
+
+
+def main() -> None:
+    """命令行入口：读证据包 -> 生成回答 -> 写答案文件并打印。"""
+    bundle = json.loads(
+        BUNDLE_PATH.read_text(encoding="utf-8")
+    )
+
+    status = bundle.get("status")
+
+    if (
+        status not in FRIENDLY_BLOCKED_ANSWERS
+        and status != "ready_for_grounding"
+    ):
+        raise SystemExit(f"Evidence gate blocked: {status}")
+
+    if status == "ready_for_grounding" and not os.environ.get(
+        "DEEPSEEK_API_KEY"
+    ):
+        raise SystemExit("DEEPSEEK_API_KEY is not set")
+
+    result = generate_answer(bundle)
+
+    OUTPUT_PATH.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print(result["answer"])
+    print(f"\nused_citations: {result['used_citations']}")
+    print(f"saved: {OUTPUT_PATH}")
+
+    if result["model"] == "fallback":
+        raise SystemExit(0)
+
+
+if __name__ == "__main__":
+    main()

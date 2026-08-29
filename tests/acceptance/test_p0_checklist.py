@@ -379,7 +379,7 @@ def run_answer_case(
                     ) as post_mock:
                         buffer = io.StringIO()
                         namespace: dict[str, Any] = {
-                            "__name__": "answer_with_citations_qdrant_under_test",
+                            "__name__": "__main__",
                             "__file__": str(ANSWER_SOURCE_PATH),
                         }
                         with redirect_stdout(buffer):

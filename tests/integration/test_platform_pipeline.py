@@ -473,9 +473,9 @@ class EvidenceGateUnitTests(unittest.TestCase):
 class AnswerScriptRoutingTests(unittest.TestCase):
     """answer_with_citations_qdrant 的固定话术路由（静态源码断言）。
 
-    说明：该脚本是“读证据包 -> 执行”的脚本式模块，直接 import 会
-    触发顶层流程并抛出 SystemExit，因此这里只做源码级路由断言，
-    避免任何副作用。
+    说明：该模块已重构为零副作用的 ``generate_answer`` + ``main()``，
+    导入不再触发顶层流程；本类仍以源码级断言固定话术路由，
+    函数级行为由 tests/unit/test_answer_generation.py 覆盖。
     """
 
     SOURCE_PATH = (
