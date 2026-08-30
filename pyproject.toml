@@ -22,3 +22,6 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+customer_service_rag = ["static/*.html", "static/*.css", "static/*.js"]

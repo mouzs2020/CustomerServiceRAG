@@ -5,6 +5,8 @@
 - API 层只做编排与异常映射：不触碰 Platform Gate、Qdrant、
   Embedding、Reranker 或 DeepSeek；不读写文件、不打印、不启动服务器。
 - 业务 blocked 状态不是 HTTP 错误，保持 HTTP 200。
+- 本地 Web 演示界面：由本包内 static/ 目录提供原生 HTML/CSS/JS，
+  路径基于 __file__ 解析；静态页面访问不触碰 RAG 管线。
 """
 
 from __future__ import annotations
@@ -13,11 +15,13 @@ import json
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import Callable
 
 import httpx
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from customer_service_rag.orchestrator import run_answer_pipeline
 from customer_service_rag.readiness import check_readiness
@@ -51,6 +55,29 @@ app = FastAPI(
 # 固定安全话术：不向客户端泄漏异常原文、API Key 或上游响应正文。
 SERVICE_UNAVAILABLE_REASON = "服务暂时不可用，请稍后重试。"
 INVALID_UPSTREAM_REASON = "上游服务返回了无效结果，请稍后重试。"
+
+# 本地演示界面静态资源：基于 __file__ 解析，禁止写死本机绝对路径。
+# 目录属于包内数据，随 setuptools package-data 一起分发。
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+app.mount(
+    "/static",
+    StaticFiles(directory=STATIC_DIR),
+    name="static",
+)
+
+
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    """本地 Web 演示界面入口：只读静态文件，不触发 RAG、模型或 DeepSeek。
+
+    include_in_schema=False：保持既有 OpenAPI 契约不变。
+    """
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        media_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def get_pipeline_runner() -> PipelineRunner:

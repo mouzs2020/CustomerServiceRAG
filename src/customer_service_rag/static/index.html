@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>跨境售后知识助手</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="app-header-inner">
+      <h1 class="app-title">跨境售后知识助手</h1>
+      <div id="service-status" class="status status-loading" role="status" aria-live="polite">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="service-status-text">检测服务状态中…</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="app-main">
+    <form id="ask-form" novalidate>
+      <section class="panel">
+        <h2 class="panel-title">进入平台</h2>
+        <p class="panel-hint">请明确选择提问所针对的平台，用于规则检索与证据匹配。</p>
+        <div class="segmented" role="radiogroup" aria-label="进入平台">
+          <label class="segment">
+            <input type="radio" name="entry-platform" value="aliexpress">
+            <span class="segment-label">AliExpress</span>
+          </label>
+          <label class="segment">
+            <input type="radio" name="entry-platform" value="temu">
+            <span class="segment-label">Temu</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2 class="panel-title">
+          <label for="question-input">退款 / 售后问题</label>
+        </h2>
+        <textarea id="question-input" name="query" rows="3"
+          placeholder="例如：AliExpress 买家收货后 15 天内申请仅退款，如何处理？"
+          maxlength="2000" autocomplete="off"></textarea>
+        <div class="form-footer">
+          <span id="input-hint" class="field-error" hidden></span>
+          <span id="char-count" class="char-count">0 / 2000</span>
+          <button type="submit" id="send-button" class="send-button" disabled>发送问题</button>
+        </div>
+      </section>
+    </form>
+
+    <section id="result-panel" class="panel result-panel" hidden>
+      <div id="loading-indicator" class="loading" hidden>
+        <span class="spinner" aria-hidden="true"></span>
+        <span>正在检索平台规则并生成回答…</span>
+      </div>
+
+      <div id="answer-block" hidden>
+        <h2 class="panel-title">回答</h2>
+        <p id="answer-text" class="answer-text"></p>
+        <div id="citations-block" hidden>
+          <h3 class="sub-title">引用</h3>
+          <div id="used-citations" class="citation-chips"></div>
+        </div>
+      </div>
+
+      <div id="blocked-block" hidden>
+        <div class="notice notice-warning">
+          <p id="blocked-message" class="notice-text"></p>
+        </div>
+        <details class="diagnostics">
+          <summary>诊断信息</summary>
+          <dl class="diag-list">
+            <dt>status</dt>
+            <dd id="blocked-status"></dd>
+            <dt>reason</dt>
+            <dd id="blocked-reason"></dd>
+          </dl>
+        </details>
+      </div>
+
+      <div id="error-block" hidden>
+        <div class="notice notice-danger">
+          <p id="error-message" class="notice-text"></p>
+          <p class="notice-meta">请求 ID：<span id="error-request-id">-</span></p>
+        </div>
+      </div>
+
+      <div id="evidence-block" hidden>
+        <h2 class="panel-title">证据列表</h2>
+        <ol id="evidence-list" class="evidence-list"></ol>
+      </div>
+    </section>
+
+    <section id="placeholder-panel" class="panel placeholder-panel">
+      <p class="placeholder-text">选择平台并输入问题后，点击“发送问题”查看基于平台规则的回答与证据。</p>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

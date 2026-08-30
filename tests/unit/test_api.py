@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -498,6 +499,152 @@ class LoggerConfigTests(ApiTestBase):
             self.assertEqual(set(data), self.REQUIRED_FIELDS)
             request_ids.append(data["request_id"])
         self.assertNotEqual(request_ids[0], request_ids[1])
+
+
+def _extract_js_function(js: str, name: str) -> str:
+    """按花括号配平提取 app.js 顶层函数源码，供前端契约断言使用。"""
+    start = js.index(f"function {name}(")
+    open_brace = js.index("{", start)
+    depth = 0
+    for index in range(open_brace, len(js)):
+        if js[index] == "{":
+            depth += 1
+        elif js[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[start : index + 1]
+    raise AssertionError(f"function {name} is not closed in app.js")
+
+
+class StaticPageTests(unittest.TestCase):
+    """本地 Web 演示界面：静态页面托管与安全约束（不触碰 RAG 管线）。"""
+
+    def setUp(self):
+        self.client = TestClient(api.app)
+        self.runner = mock.Mock()
+        self.readiness_checker = mock.Mock()
+        api.app.dependency_overrides[api.get_pipeline_runner] = (
+            lambda: self.runner
+        )
+        api.app.dependency_overrides[api.get_readiness_checker] = (
+            lambda: self.readiness_checker
+        )
+
+    def tearDown(self):
+        api.app.dependency_overrides.clear()
+
+    def get(self, path):
+        return self.client.get(path)
+
+    def test_index_returns_200_with_html(self):
+        response = self.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            response.headers["content-type"].startswith("text/html")
+        )
+        html = response.text
+        self.assertIn("跨境售后知识助手", html)
+
+    def test_index_contains_platform_question_and_send_controls(self):
+        html = self.get("/").text
+        # 平台分段控件（必须明确选择的单选组）
+        self.assertIn('name="entry-platform"', html)
+        self.assertIn('value="aliexpress"', html)
+        self.assertIn('value="temu"', html)
+        self.assertIn("AliExpress", html)
+        self.assertIn("Temu", html)
+        # 问题输入与发送控件
+        self.assertIn('id="question-input"', html)
+        self.assertIn('id="send-button"', html)
+        self.assertIn("发送问题", html)
+        # 引用 /static 下的样式与脚本
+        self.assertIn("/static/app.css", html)
+        self.assertIn("/static/app.js", html)
+
+    def test_css_and_js_assets_return_200(self):
+        for path in ("/static/app.css", "/static/app.js"):
+            with self.subTest(path=path):
+                response = self.get(path)
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(len(response.content) > 0)
+
+    def test_static_assets_serve_expected_content(self):
+        css = self.get("/static/app.css").text
+        self.assertIn(".send-button", css)
+        js = self.get("/static/app.js").text
+        self.assertIn("/v1/answer", js)
+        self.assertIn("entry_platform", js)
+
+    def test_static_page_access_does_not_trigger_rag_or_readiness(self):
+        for path in ("/", "/static/app.css", "/static/app.js"):
+            self.get(path)
+        self.runner.assert_not_called()
+        self.readiness_checker.assert_not_called()
+
+    def test_index_carries_request_id_header(self):
+        response = self.get("/")
+        self.assertIn("X-Request-ID", response.headers)
+        uuid.UUID(response.headers["X-Request-ID"])
+
+    def test_frontend_uses_textcontent_only(self):
+        js = (api.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        for forbidden in (
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+        ):
+            self.assertNotIn(forbidden, js)
+        self.assertIn("textContent", js)
+
+    def test_service_ready_gates_send_button(self):
+        js = (api.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        # serviceReady 初始为 false，仅 /ready 返回 ready 时为 true。
+        self.assertIn("var serviceReady = false;", js)
+        render = _extract_js_function(js, "renderServiceStatus")
+        self.assertIn('serviceReady = status === "ready";', render)
+        # 发送按钮可用性必须同时包含非 loading / serviceReady / 输入合法。
+        enabled = _extract_js_function(js, "isSendEnabled")
+        self.assertIn("!loading", enabled)
+        self.assertIn("serviceReady", enabled)
+        self.assertIn("isInputValid", enabled)
+        for name in ("refreshSendState", "setLoadingState"):
+            body = _extract_js_function(js, name)
+            self.assertIn("isSendEnabled()", body)
+        # /ready 请求失败按 unknown 处理，serviceReady 保持 false。
+        self.assertIn('renderServiceStatus("unknown")', js)
+
+    def test_platform_controls_disabled_while_loading(self):
+        js = (api.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        body = _extract_js_function(js, "setLoadingState")
+        # loading 期间：问题输入与两个 entry-platform radio 均被禁用。
+        self.assertIn("els.question.disabled = next;", body)
+        self.assertIn("els.platformRadios.forEach", body)
+        self.assertIn("radio.disabled = next;", body)
+        self.assertIn('input[name="entry-platform"]', js)
+        # 请求结束后按钮状态交回 isSendEnabled（serviceReady + 输入合法性）。
+        self.assertIn("els.send.disabled = !isSendEnabled();", body)
+
+    def test_answer_timeout_at_least_180000(self):
+        js = (api.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        match = re.search(r"var ANSWER_TIMEOUT_MS = (\d+);", js)
+        self.assertIsNotNone(match)
+        self.assertGreaterEqual(int(match.group(1)), 180000)
+
+    def test_status_text_uses_chinese_labels(self):
+        js = (api.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        render = _extract_js_function(js, "renderServiceStatus")
+        self.assertIn("服务就绪", render)
+        self.assertIn("服务未就绪", render)
+        self.assertIn("状态检测失败", render)
+        self.assertNotIn('setText(els.statusText, "ready")', render)
+        self.assertNotIn('setText(els.statusText, "not_ready")', render)
+
+    def test_openapi_contract_unchanged_by_static_routes(self):
+        schema = api.app.openapi()
+        self.assertNotIn("/", schema["paths"])
+        for path in ("/health", "/ready", "/v1/answer"):
+            self.assertIn(path, schema["paths"])
 
 
 if __name__ == "__main__":
