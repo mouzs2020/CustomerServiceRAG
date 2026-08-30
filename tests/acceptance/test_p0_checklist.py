@@ -45,6 +45,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from customer_service_rag import intent_classifier
 from customer_service_rag import platform_gate
 from customer_service_rag import prepare_evidence_qdrant as peq
+from customer_service_rag import retrieval_runtime
 from customer_service_rag.intent_classifier import IntentClassifierError
 from customer_service_rag.platform_gate import (
     UNRELATED_FALLBACK,
@@ -155,6 +156,9 @@ def run_real_boundary(
     rerank_scores: list[float],
 ) -> str:
     """真实跑通 retrieve_and_rank，只 Mock 底层 torch/qdrant/模型库。"""
+    # 测试隔离：清空进程内模型缓存，确保本案例加载的是本次装入的
+    # Mock 模型，而不是其他案例（或 heavy 真实模型）遗留的缓存。
+    retrieval_runtime.clear_model_caches()
     torch_mod = mock.MagicMock(name="torch")
     qdrant_mod = mock.MagicMock(name="qdrant_client")
     st_mod = mock.MagicMock(name="sentence_transformers")
@@ -256,6 +260,9 @@ HEAVY_ALLOWED_GATES = {
 
 def run_heavy_e2e(platform: str) -> str:
     """加载全部真实模型的完整检索链路 + 生产 Evidence Gate 判定。"""
+    # 测试隔离：清空缓存，保证 heavy 用例加载的是真实模型，
+    # 不会复用此前 unit+mock 案例装入的 Mock 模型实例。
+    retrieval_runtime.clear_model_caches()
     try:
         candidates = peq.retrieve_and_rank("退款流程是什么", platform)
     except Exception as exc:  # noqa: BLE001 —— 模型/存储不可用时如实上报

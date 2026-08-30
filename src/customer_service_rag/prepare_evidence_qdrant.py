@@ -20,6 +20,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from customer_service_rag import retrieval_runtime
 from customer_service_rag.intent_classifier import (
     IntentClassifierError,
     classify_intent,
@@ -355,18 +356,20 @@ def retrieve_and_rank(
       由 Evidence Gate 给出正式状态（blocked_no_matching_source）；
     - 跨平台候选：不再抛异常，原样交给 Evidence Gate
       判定为 blocked_platform_evidence_mismatch。
+
+    模型复用：Embedding 模型按 manifest 的 model_id、Reranker
+    Tokenizer/Model 按 RERANKER_ID 经 ``retrieval_runtime`` 进程内
+    线程安全惰性缓存；同一进程连续调用不会重复加载模型，
+    但每次调用仍会重新连接 Qdrant 并执行查询。
     """
     import torch
     from qdrant_client import QdrantClient, models
-    from sentence_transformers import SentenceTransformer
-    from transformers import (
-        AutoModelForSequenceClassification,
-        AutoTokenizer,
-    )
 
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
 
-    model = SentenceTransformer(manifest["model_id"], device="cpu")
+    # Embedding 模型按 model_id 进程内缓存（线程安全惰性加载）；
+    # Reranker 在下方确认有候选后才加载/复用。
+    model = retrieval_runtime.get_embedding_model(manifest["model_id"])
     query_embedding = model.encode(
         [QUERY_PREFIX + query],
         convert_to_numpy=True,
@@ -405,8 +408,8 @@ def retrieve_and_rank(
     if not candidates:
         return []
 
-    rerank_tokenizer = AutoTokenizer.from_pretrained(RERANKER_ID)
-    reranker = AutoModelForSequenceClassification.from_pretrained(RERANKER_ID)
+    # Reranker Tokenizer/Model 进程内缓存：首次需要时加载，后续复用。
+    rerank_tokenizer, reranker = retrieval_runtime.get_reranker(RERANKER_ID)
     reranker.eval()
 
     pairs = [

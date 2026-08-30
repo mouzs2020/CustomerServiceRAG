@@ -24,3 +24,6 @@ output/
 
 # Review notes
 .review-notes/
+
+# Local agent workspace
+.workbuddy/

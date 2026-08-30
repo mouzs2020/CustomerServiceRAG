@@ -21,6 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 import evaluation.eval_intent_classifier as eval_module
 from customer_service_rag import intent_classifier
 from customer_service_rag import prepare_evidence_qdrant as peq
+from customer_service_rag import retrieval_runtime
 from customer_service_rag.intent_classifier import IntentClassifierError
 
 
@@ -614,6 +615,58 @@ def make_point(platform: str, chunk_id: str, retrieve_score: float) -> mock.Mock
     return point
 
 
+def make_manifest_mock(model_id: str = "fake-model") -> mock.Mock:
+    """构造 MANIFEST_PATH 替身：read_text 返回指定 model_id 的清单。"""
+    manifest_mock = mock.Mock()
+    manifest_mock.read_text.return_value = json.dumps({"model_id": model_id})
+    return manifest_mock
+
+
+def install_fake_stack(
+    points: list[mock.Mock],
+    rerank_scores: list[float],
+) -> dict[str, mock.Mock]:
+    """构造假的 torch/qdrant_client/sentence_transformers/transformers 模块。"""
+    torch_mod = mock.MagicMock(name="torch")
+    qdrant_mod = mock.MagicMock(name="qdrant_client")
+    st_mod = mock.MagicMock(name="sentence_transformers")
+    tf_mod = mock.MagicMock(name="transformers")
+
+    client_instance = qdrant_mod.QdrantClient.return_value
+    client_instance.query_points.return_value.points = points
+
+    st_model = st_mod.SentenceTransformer.return_value
+    st_model.encode.return_value = np.zeros((1, 4), dtype=np.float32)
+
+    reranker_instance = (
+        tf_mod.AutoModelForSequenceClassification.from_pretrained.return_value
+    )
+    reranker_instance.return_value.logits.view.return_value.float.return_value.tolist.return_value = list(
+        rerank_scores
+    )
+
+    return {
+        "torch": torch_mod,
+        "qdrant_client": qdrant_mod,
+        "sentence_transformers": st_mod,
+        "transformers": tf_mod,
+    }
+
+
+def call_real_retrieval(
+    modules: dict[str, mock.Mock],
+    query: str = "退款流程是什么",
+    platform: str = "aliexpress",
+    model_id: str = "fake-model",
+):
+    """在底层库被替换的情况下真实调用 retrieve_and_rank。"""
+    with (
+        mock.patch.dict(sys.modules, modules),
+        mock.patch.object(peq, "MANIFEST_PATH", make_manifest_mock(model_id)),
+    ):
+        return peq.retrieve_and_rank(query, platform)
+
+
 class RetrieveRealBoundaryTests(unittest.TestCase):
     """真实跑通 retrieve_and_rank（只 Mock 底层客户端/模型）。
 
@@ -624,57 +677,20 @@ class RetrieveRealBoundaryTests(unittest.TestCase):
     QUERY = "退款流程是什么"
     PLATFORM = "aliexpress"
 
-    def install_fake_stack(
-        self,
-        points: list[mock.Mock],
-        rerank_scores: list[float],
-    ) -> dict[str, mock.Mock]:
-        torch_mod = mock.MagicMock(name="torch")
-        qdrant_mod = mock.MagicMock(name="qdrant_client")
-        st_mod = mock.MagicMock(name="sentence_transformers")
-        tf_mod = mock.MagicMock(name="transformers")
+    def setUp(self):
+        retrieval_runtime.clear_model_caches()
 
-        client_instance = qdrant_mod.QdrantClient.return_value
-        client_instance.query_points.return_value.points = points
-
-        st_model = st_mod.SentenceTransformer.return_value
-        st_model.encode.return_value = np.zeros((1, 4), dtype=np.float32)
-
-        reranker_instance = (
-            tf_mod.AutoModelForSequenceClassification.from_pretrained.return_value
-        )
-        reranker_instance.return_value.logits.view.return_value.float.return_value.tolist.return_value = list(
-            rerank_scores
-        )
-
-        return {
-            "torch": torch_mod,
-            "qdrant_client": qdrant_mod,
-            "sentence_transformers": st_mod,
-            "transformers": tf_mod,
-        }
-
-    def call_real_retrieval(self, modules: dict[str, mock.Mock]):
-        manifest_mock = mock.Mock()
-        manifest_mock.read_text.return_value = json.dumps(
-            {"model_id": "fake-model"}
-        )
-        with (
-            mock.patch.dict(sys.modules, modules),
-            mock.patch.object(peq, "MANIFEST_PATH", manifest_mock),
-        ):
-            return peq.retrieve_and_rank(self.QUERY, self.PLATFORM)
+    def tearDown(self):
+        # 模型缓存可能持有本测试装入的 Mock 对象，不清会泄漏给后续测试。
+        retrieval_runtime.clear_model_caches()
 
     def run_main_with_fake_stack(
         self,
         points: list[mock.Mock],
         rerank_scores: list[float],
     ) -> tuple[dict, mock.Mock]:
-        modules = self.install_fake_stack(points, rerank_scores)
-        manifest_mock = mock.Mock()
-        manifest_mock.read_text.return_value = json.dumps(
-            {"model_id": "fake-model"}
-        )
+        modules = install_fake_stack(points, rerank_scores)
+        manifest_mock = make_manifest_mock()
         full_argv = ["prepare_evidence_qdrant.py", *ALIEXPRESS_QUERY_OK]
         with (
             mock.patch.dict(sys.modules, modules),
@@ -690,8 +706,8 @@ class RetrieveRealBoundaryTests(unittest.TestCase):
         return bundle, modules["transformers"]
 
     def test_zero_candidates_direct_call_returns_empty_without_models(self):
-        modules = self.install_fake_stack(points=[], rerank_scores=[])
-        result = self.call_real_retrieval(modules)
+        modules = install_fake_stack(points=[], rerank_scores=[])
+        result = call_real_retrieval(modules)
         self.assertEqual(result, [])
         tf_mod = modules["transformers"]
         tf_mod.AutoTokenizer.from_pretrained.assert_not_called()
@@ -705,11 +721,11 @@ class RetrieveRealBoundaryTests(unittest.TestCase):
 
     def test_p1_3_cross_platform_candidate_reaches_gate(self):
         # 直接调用：跨平台候选不再抛 RuntimeError，而是返回给调用方。
-        modules = self.install_fake_stack(
+        modules = install_fake_stack(
             points=[make_point("temu", "t-cross", 0.9)],
             rerank_scores=[6.5],
         )
-        result = self.call_real_retrieval(modules)
+        result = call_real_retrieval(modules)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["record"]["platform"], "temu")
 
@@ -738,6 +754,142 @@ class RetrieveRealBoundaryTests(unittest.TestCase):
         self.assertEqual(platforms, {"aliexpress"})
         # 按重排分数降序，最高分在前。
         self.assertEqual(bundle["evidence"][0]["chunk_id"], "a-hi")
+
+
+class ModelCacheTests(unittest.TestCase):
+    """进程内模型缓存行为：连续调用只加载一次，失败/清理可恢复。
+
+    每个用例前后都清空缓存：Mock 模型实例绝不跨测试泄漏。
+    """
+
+    QUERY = "退款流程是什么"
+    PLATFORM = "aliexpress"
+
+    def setUp(self):
+        retrieval_runtime.clear_model_caches()
+
+    def tearDown(self):
+        retrieval_runtime.clear_model_caches()
+
+    def test_two_calls_load_models_once_encode_twice_query_twice(self):
+        modules = install_fake_stack(
+            points=[make_point(self.PLATFORM, "a-cache", 0.9)],
+            rerank_scores=[6.5],
+        )
+        first = call_real_retrieval(modules, self.QUERY, self.PLATFORM)
+        second = call_real_retrieval(modules, self.QUERY, self.PLATFORM)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+
+        st_mod = modules["sentence_transformers"]
+        st_mod.SentenceTransformer.assert_called_once()
+        self.assertEqual(
+            st_mod.SentenceTransformer.return_value.encode.call_count, 2
+        )
+
+        tf_mod = modules["transformers"]
+        tf_mod.AutoTokenizer.from_pretrained.assert_called_once()
+        tf_mod.AutoModelForSequenceClassification.from_pretrained.assert_called_once()
+
+        # QdrantClient 不缓存：每次调用都新建连接并查询一次。
+        qdrant_mod = modules["qdrant_client"]
+        self.assertEqual(qdrant_mod.QdrantClient.call_count, 2)
+        self.assertEqual(
+            qdrant_mod.QdrantClient.return_value.query_points.call_count, 2
+        )
+
+    def test_zero_candidates_never_load_reranker(self):
+        modules = install_fake_stack(points=[], rerank_scores=[])
+        first = call_real_retrieval(modules, self.QUERY, self.PLATFORM)
+        second = call_real_retrieval(modules, self.QUERY, self.PLATFORM)
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        tf_mod = modules["transformers"]
+        tf_mod.AutoTokenizer.from_pretrained.assert_not_called()
+        tf_mod.AutoModelForSequenceClassification.from_pretrained.assert_not_called()
+
+    def test_different_model_id_not_reused(self):
+        modules_a = install_fake_stack(
+            points=[make_point(self.PLATFORM, "a-mid", 0.9)],
+            rerank_scores=[6.5],
+        )
+        modules_b = install_fake_stack(
+            points=[make_point(self.PLATFORM, "b-mid", 0.9)],
+            rerank_scores=[6.5],
+        )
+        result_a = call_real_retrieval(modules_a, model_id="model-a")
+        result_b = call_real_retrieval(modules_b, model_id="model-b")
+
+        self.assertEqual(len(result_a), 1)
+        self.assertEqual(len(result_b), 1)
+        modules_a["sentence_transformers"].SentenceTransformer\
+            .assert_called_once_with("model-a", device="cpu")
+        modules_b["sentence_transformers"].SentenceTransformer\
+            .assert_called_once_with("model-b", device="cpu")
+
+    def test_embedding_load_failure_not_cached_retry_succeeds(self):
+        modules = install_fake_stack(
+            points=[make_point(self.PLATFORM, "a-retry", 0.9)],
+            rerank_scores=[6.5],
+        )
+        st_cls = modules["sentence_transformers"].SentenceTransformer
+        st_cls.side_effect = RuntimeError("embedding load failed")
+
+        with self.assertRaises(RuntimeError):
+            call_real_retrieval(modules, self.QUERY, self.PLATFORM)
+
+        st_cls.side_effect = None
+        result = call_real_retrieval(modules, self.QUERY, self.PLATFORM)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(st_cls.call_count, 2)
+
+    def test_reranker_load_failure_not_cached_retry_succeeds(self):
+        modules = install_fake_stack(
+            points=[make_point(self.PLATFORM, "a-rerank", 0.9)],
+            rerank_scores=[6.5],
+        )
+        tf_mod = modules["transformers"]
+        tf_mod.AutoModelForSequenceClassification.from_pretrained\
+            .side_effect = RuntimeError("reranker load failed")
+
+        with self.assertRaises(RuntimeError):
+            call_real_retrieval(modules, self.QUERY, self.PLATFORM)
+
+        # Tokenizer/Model 成对缓存：失败时不留半成品（Tokenizer 需重载）。
+        tf_mod.AutoModelForSequenceClassification.from_pretrained\
+            .side_effect = None
+        result = call_real_retrieval(modules, self.QUERY, self.PLATFORM)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(
+            tf_mod.AutoTokenizer.from_pretrained.call_count, 2
+        )
+        self.assertEqual(
+            tf_mod.AutoModelForSequenceClassification
+            .from_pretrained.call_count,
+            2,
+        )
+
+    def test_clear_model_caches_forces_reload(self):
+        modules = install_fake_stack(
+            points=[make_point(self.PLATFORM, "a-clear", 0.9)],
+            rerank_scores=[6.5],
+        )
+        call_real_retrieval(modules, self.QUERY, self.PLATFORM)
+        retrieval_runtime.clear_model_caches()
+        call_real_retrieval(modules, self.QUERY, self.PLATFORM)
+
+        self.assertEqual(
+            modules["sentence_transformers"].SentenceTransformer.call_count, 2
+        )
+        tf_mod = modules["transformers"]
+        self.assertEqual(tf_mod.AutoTokenizer.from_pretrained.call_count, 2)
+        self.assertEqual(
+            tf_mod.AutoModelForSequenceClassification.from_pretrained
+            .call_count,
+            2,
+        )
 
 
 class IntentThresholdPipelineTests(unittest.TestCase):
