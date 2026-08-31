@@ -55,7 +55,8 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-- 依赖版本直接固化在 `pyproject.toml`（无依赖锁文件），安装需联网下载 torch 等大包；
+- 10 个直接运行时依赖的版本已使用 `==` 固定在 `pyproject.toml`；传递依赖尚未锁定，
+  当前不维护依赖锁文件；安装需联网下载 torch 等大包；
 - 知识库产物 `output/`（Qdrant 存储与 embedding manifest）必须已存在：从既有环境复制，
   或按 [docs/MAIN_FLOW.md](docs/MAIN_FLOW.md) 的离线入库链重建（重建需要 `data/*.docx`
   原始文档，并联网下载 BGE 模型）。
@@ -118,6 +119,9 @@ Mock 替换）；online / heavy 验收默认跳过（即基线中的 2 skipped�
 `RAG_P0_ONLINE=1` 且环境已有 `DEEPSEEK_API_KEY` 才真实调用 DeepSeek；设置
 `RAG_P0_HEAVY=1` 才加载真实 Embedding / Reranker 与 Embedded Qdrant（本地检索栈，
 非在线外部调用）。
+
+GitHub Actions 在 Python 3.10 上执行 `python -m pip install .` 安装项目，随后运行
+`python -m unittest discover`，验证项目安装和确定性测试。
 
 ## 文档
 
