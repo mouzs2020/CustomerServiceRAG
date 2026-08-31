@@ -82,6 +82,11 @@ function Report-Check {
     }
 }
 
+function Test-PositiveInteger {
+    param([object]$Value)
+    return (($Value -is [System.Int32] -or $Value -is [System.Int64]) -and $Value -gt 0)
+}
+
 if ($envFileLoaded) {
     Write-Host ("[ OK ] env file loaded: {0} (process env has priority)" -f $EnvFile)
 } else {
@@ -100,8 +105,8 @@ if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
 }
 $manifestOk = ($null -ne $manifest) `
     -and $manifest.PSObject.Properties.Name -contains 'model_id' -and "$($manifest.model_id)".Trim() `
-    -and $manifest.PSObject.Properties.Name -contains 'embedding_dimension' -and ($manifest.embedding_dimension -is [int]) -and $manifest.embedding_dimension -gt 0 `
-    -and $manifest.PSObject.Properties.Name -contains 'chunk_count' -and ($manifest.chunk_count -is [int]) -and $manifest.chunk_count -gt 0 `
+    -and $manifest.PSObject.Properties.Name -contains 'embedding_dimension' -and (Test-PositiveInteger $manifest.embedding_dimension) `
+    -and $manifest.PSObject.Properties.Name -contains 'chunk_count' -and (Test-PositiveInteger $manifest.chunk_count) `
     -and $manifest.PSObject.Properties.Name -contains 'chunk_ids' -and @($manifest.chunk_ids).Count -eq $manifest.chunk_count
 Report-Check $manifestOk 'embedding_manifest' $manifestPath
 
@@ -119,7 +124,7 @@ if (Test-Path -LiteralPath $metaPath -PathType Leaf) {
 Report-Check ($null -ne $qdrantVectors) 'qdrant_collection' ("{0} :: {1}" -f $metaPath, $collectionName)
 
 $dimensionOk = $manifestOk -and ($null -ne $qdrantVectors) `
-    -and ($qdrantVectors.size -is [int]) -and ($qdrantVectors.size -eq $manifest.embedding_dimension) `
+    -and (Test-PositiveInteger $qdrantVectors.size) -and ($qdrantVectors.size -eq $manifest.embedding_dimension) `
     -and ("$($qdrantVectors.distance)" -eq 'Cosine')
 Report-Check $dimensionOk 'dimension_match' ("manifest={0} qdrant={1}" -f $(if ($manifestOk) { $manifest.embedding_dimension } else { '?' }), $(if ($qdrantVectors) { $qdrantVectors.size } else { '?' }))
 

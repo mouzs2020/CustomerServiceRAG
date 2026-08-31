@@ -101,13 +101,13 @@ def run_agent_orchestrator(
     tool_calls = 0
     traces: list[AgentToolTrace] = []
 
-    def invoke_tool(platform: Platform) -> AnswerResponse:
+    def invoke_tool(platform: Platform, tool_query: str = request.query) -> AnswerResponse:
         nonlocal tool_calls
         if tool_calls >= MAX_RAG_TOOL_CALLS:
             raise RuntimeError("Agent RAG tool-call limit reached")
         tool_calls += 1
         result = pipeline(
-            AnswerRequest(query=request.query, entry_platform=platform),
+            AnswerRequest(query=tool_query, entry_platform=platform),
             request_id_factory=lambda: request_id,
         )
         if not isinstance(result, AnswerResponse):
@@ -135,9 +135,12 @@ def run_agent_orchestrator(
         )
 
     if route.action == AgentAction.COMPARE_PLATFORMS:
+        if route.tool_query is None:
+            raise ValueError("compare_platforms requires tool_query")
+        tool_query = route.tool_query
         results = [
-            invoke_tool(Platform.ALIEXPRESS),
-            invoke_tool(Platform.TEMU),
+            invoke_tool(Platform.ALIEXPRESS, tool_query),
+            invoke_tool(Platform.TEMU, tool_query),
         ]
         return AgentAnswerResponse(
             request_id=request_id,

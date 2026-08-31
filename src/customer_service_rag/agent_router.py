@@ -14,6 +14,7 @@ from customer_service_rag.intent_classifier import (
     DEEPSEEK_CHAT_URL,
     get_intent_model,
 )
+from customer_service_rag.platform_gate import detect_platforms_in_query
 from customer_service_rag.schemas import Platform
 
 
@@ -37,6 +38,7 @@ class AgentRoute(BaseModel):
     action: AgentAction
     platform: Platform | None = None
     clarification: str | None = Field(default=None, min_length=1, max_length=300)
+    tool_query: str | None = Field(default=None, max_length=2000)
 
     @field_validator("clarification")
     @classmethod
@@ -48,21 +50,35 @@ class AgentRoute(BaseModel):
             raise ValueError("clarification must not be blank")
         return cleaned
 
+    @field_validator("tool_query")
+    @classmethod
+    def _strip_tool_query(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("tool_query must not be blank")
+        return cleaned
+
     @model_validator(mode="after")
     def _validate_action_parameters(self) -> "AgentRoute":
         if self.action == AgentAction.SINGLE_PLATFORM:
             if self.platform is None:
                 raise ValueError("single_platform requires platform")
-            if self.clarification is not None:
-                raise ValueError("single_platform forbids clarification")
+            if self.clarification is not None or self.tool_query is not None:
+                raise ValueError("single_platform forbids clarification and tool_query")
         elif self.action == AgentAction.COMPARE_PLATFORMS:
             if self.platform is not None or self.clarification is not None:
-                raise ValueError("compare_platforms forbids parameters")
+                raise ValueError("compare_platforms forbids platform and clarification")
+            if self.tool_query is None:
+                raise ValueError("compare_platforms requires tool_query")
+            if detect_platforms_in_query(self.tool_query):
+                raise ValueError("compare_platforms tool_query must be platform-neutral")
         elif self.action == AgentAction.CLARIFY:
-            if self.platform is not None or self.clarification is None:
+            if self.platform is not None or self.clarification is None or self.tool_query is not None:
                 raise ValueError("clarify requires clarification only")
         elif self.action == AgentAction.REJECT:
-            if self.platform is not None or self.clarification is not None:
+            if self.platform is not None or self.clarification is not None or self.tool_query is not None:
                 raise ValueError("reject forbids parameters")
         return self
 
@@ -79,14 +95,18 @@ ROUTER_SYSTEM_PROMPT = """\
 
 你只能从以下动作中选择一个：
 - single_platform：问题明确针对一个平台；必须填写 platform。
-- compare_platforms：用户明确要求比较 AliExpress 与 Temu；不得填写 platform。
+- compare_platforms：用户明确要求比较 AliExpress 与 Temu；必须填写平台中性的 tool_query，不得填写 platform。
 - clarify：信息不足以判断退款售后问题或目标平台；必须填写简短 clarification。
 - reject：明确属于天气、编程、招聘、闲聊等非退款售后问题；不得填写其他字段。
 
 platform 只能是 aliexpress 或 temu。entry_platform 已提供且问题未明确要求比较时，
-single_platform 应使用 entry_platform。只输出一个原始 JSON 对象，禁止 Markdown、代码块、
-解释文字或额外字段，格式必须是：
-{"action":"single_platform|compare_platforms|clarify|reject","platform":"aliexpress|temu|null","clarification":"string|null"}
+single_platform 应使用 entry_platform。compare_platforms 的 tool_query 必须是从原问题提取的、
+平台中性的直接单平台问题，不得包含 AliExpress、Temu、速卖通，不得添加用户未询问的业务条件。
+例如：原问题：比较 AliExpress 和 Temu 的退款申请流程有什么不同？
+tool_query：退款申请需要哪些材料，平台如何审核和处理？
+single_platform、clarify、reject 的 tool_query 必须为 null。只输出一个原始 JSON 对象，
+禁止 Markdown、代码块、解释文字或额外字段，格式必须是：
+{"action":"single_platform|compare_platforms|clarify|reject","platform":"aliexpress|temu|null","clarification":"string|null","tool_query":"string|null"}
 """.strip()
 
 

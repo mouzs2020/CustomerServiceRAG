@@ -107,6 +107,15 @@ class AgentRouterTests(unittest.TestCase):
             AgentRoute(action="single_platform", platform="amazon")
         with self.assertRaises(ValueError):
             AgentRoute(action="clarify", clarification="   ")
+        with self.assertRaises(ValueError):
+            AgentRoute(action="compare_platforms")
+        for platform_name in ("AliExpress", "Temu", "速卖通"):
+            with self.subTest(platform_name=platform_name):
+                with self.assertRaises(ValueError):
+                    AgentRoute(
+                        action="compare_platforms",
+                        tool_query=f"{platform_name} 退款申请流程",
+                    )
 
 
 class AgentOrchestratorTests(unittest.TestCase):
@@ -153,7 +162,12 @@ class AgentOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.tool_trace[0].platform, Platform.TEMU)
 
     def test_compare_is_sequential_and_returns_two_raw_answers(self):
-        router = mock.Mock(return_value=AgentRoute(action="compare_platforms"))
+        router = mock.Mock(
+            return_value=AgentRoute(
+                action="compare_platforms",
+                tool_query="退款申请流程是什么？",
+            )
+        )
         pipeline = mock.Mock(
             side_effect=[
                 make_answer("aliexpress", "req-a"),
@@ -171,6 +185,37 @@ class AgentOrchestratorTests(unittest.TestCase):
         ])
         self.assertEqual([trace.step for trace in result.tool_trace], [1, 2])
         self.assertEqual(pipeline.call_count, 2)
+
+    def test_compare_uses_shared_platform_neutral_query(self):
+        request = AgentAnswerRequest(
+            query="请比较 ALIEXPRESS、Temu 和速卖通的退款申请流程有什么不同？"
+        )
+        router = mock.Mock(
+            return_value=AgentRoute(
+                action="compare_platforms",
+                tool_query="退款申请流程有什么不同？",
+            )
+        )
+        pipeline = mock.Mock(
+            side_effect=[
+                make_answer("aliexpress", "req-a"),
+                make_answer("temu", "req-t"),
+            ]
+        )
+
+        run_agent_orchestrator(request, router=router, pipeline=pipeline)
+
+        calls = pipeline.call_args_list
+        tool_queries = [call.args[0].query for call in calls]
+        self.assertEqual(tool_queries[0], tool_queries[1])
+        self.assertNotIn("aliexpress", tool_queries[0].lower())
+        self.assertNotIn("temu", tool_queries[0].lower())
+        self.assertNotIn("速卖通", tool_queries[0])
+        self.assertIn("退款申请流程", tool_queries[0])
+        self.assertEqual(
+            [call.args[0].entry_platform for call in calls],
+            [Platform.ALIEXPRESS, Platform.TEMU],
+        )
 
     def test_clarify_and_reject_do_not_call_rag(self):
         pipeline = mock.Mock()
@@ -231,7 +276,10 @@ class AgentApiTests(unittest.TestCase):
         self.assertNotIn("secret", response.text)
 
     def test_compare_api_returns_two_answers_and_trace(self):
-        self.router.return_value = AgentRoute(action="compare_platforms")
+        self.router.return_value = AgentRoute(
+            action="compare_platforms",
+            tool_query="退款申请流程",
+        )
         self.pipeline.side_effect = [
             make_answer("aliexpress", "req-a"),
             make_answer("temu", "req-t"),
