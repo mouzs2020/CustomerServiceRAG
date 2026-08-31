@@ -25,5 +25,8 @@ output/
 # Review notes
 .review-notes/
 
+# Personal artifacts
+/简历V3.html
+
 # Local agent workspace
 .workbuddy/
