@@ -51,14 +51,33 @@ py -3.10 -m venv .venv
 
 - 程序**只从环境变量** `DEEPSEEK_API_KEY` 读取密钥，**不会自动加载**根目录的
   `deepseek_api.env`（该文件只是人工保存密钥的地方，需要自行设置到环境变量）；
-- 必须在**启动 Uvicorn 的同一终端**设置——`$env:` 仅对当前终端会话生效，
-  换终端要重新设置：
+- 变量清单见 [.env.example](.env.example)：复制为 `.env`（已被 git 忽略）填入真实值。
+  两种方式二选一：
+  - **用启动脚本**（推荐）：`scripts/start_web.ps1` 会自动加载 `.env` 中的白名单变量，
+    无需手动设置；已在当前进程中设置的同名环境变量**优先于** `.env`，不会被覆盖；
+  - **直接运行 Uvicorn**：脚本不参与，必须在**启动 Uvicorn 的同一终端**手动设置——
+    `$env:` 仅对当前终端会话生效，换终端要重新设置：
 
 ```powershell
 $env:DEEPSEEK_API_KEY = "sk-你的密钥"
 ```
 
 ## 启动与访问
+
+### 方式一：启动脚本（推荐）
+
+```powershell
+.\scripts\start_web.ps1                 # 读取根目录 .env，检查通过后前台启动
+.\scripts\start_web.ps1 -CheckOnly     # 只做检查不启动（全部通过退出码 0）
+.\scripts\start_web.ps1 -Port 8080 -BindHost 0.0.0.0 -EnvFile .\other.env
+```
+
+脚本行为：默认加载项目根 `.env`（仅白名单变量，纯文本解析，不执行任何脚本内容；
+`DEEPSEEK_API_KEY` 只报告是否已设置、绝不打印），依次检查 `.venv` Python、
+`output/embedding_manifest.json`、`output/qdrant_storage/meta.json`（collection 与
+维度匹配）与 API Key，全部通过后**自动切到项目根**前台启动 Uvicorn（Ctrl+C 停止）。
+
+### 方式二：直接运行 Uvicorn
 
 仍在项目根、设置好 Key 的同一终端执行（readiness 与检索按相对路径定位
 `output/`，换目录启动会找不到知识库）：
