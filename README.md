@@ -92,17 +92,6 @@ Mock 替换）；online / heavy 验收默认跳过（即基线中的 2 skipped�
 - [docs/MAIN_FLOW.md](docs/MAIN_FLOW.md)：主流程地图——完整架构、接口契约、
   证据包状态机与限制细节。
 
-## 当前限制（如实）
-
-- **Citation Validator 只做形式校验**：校验非固定话术回答至少有一条引用、
-  且引用 ID 属于本次证据集合；不验证语义正确性，也不验证每项结论是否都有引用；
-- **Evidence Gate 阈值未评测标定**：`MIN_RERANK_SCORE=0.75` 是初始防线，未经检索
-  评测确定；
-- **合并规则硬编码**：`merge_chunks.py` 写死指定父章节，新增文档或章节需改脚本；
-- **索引只支持全量重建**：无增量更新，改动任一环需重跑整条入库链；
-- **Embedded Qdrant 未验证多 Worker**：本地嵌入式模式，未验证多进程 / 多 Worker 部署；
-- **无依赖锁文件**：依赖版本固化在 `pyproject.toml`，无 requirements.txt / lock 文件；
-- 定位为**本地单进程演示**：未验证生产可用性与高并发，引用不保证完全可靠。
 
 ## Roadmap（仅计划，均未实现）
 
