@@ -24,6 +24,19 @@ output/qdrant_storage + output/embedding_manifest.json
 
 业务 blocked 状态返回 HTTP 200（fail closed），不做通用兜底回答。
 
+## 界面演示
+
+同一界面支持显式选择 AliExpress / Temu 平台，回答展示引用编号及对应证据内容，
+便于核对生成结果与知识库来源。
+
+**AliExpress：签收后退款审核流程**
+
+![AliExpress 退款售后问答演示](docs/assets/demo-aliexpress.png)
+
+**Temu：商品未收到退款处理**
+
+![Temu 退款售后问答演示](docs/assets/demo-temu.png)
+
 ## HTTP 接口
 
 | 方法 | 路径 | 作用 |
@@ -110,6 +123,7 @@ Mock 替换）；online / heavy 验收默认跳过（即基线中的 2 skipped�
 
 - [docs/MAIN_FLOW.md](docs/MAIN_FLOW.md)：主流程地图——完整架构、接口契约、
   证据包状态机与限制细节。
+- [docs/TEST_REPORT.md](docs/TEST_REPORT.md)：本轮已确认的演示与测试事实。
 
 
 ## Roadmap（仅计划，均未实现）
