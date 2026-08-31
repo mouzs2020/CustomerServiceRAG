@@ -50,14 +50,24 @@ EVAL_CASES: list[tuple[str, str, str]] = [
     ("我的包裹一直没到怎么办", "refund_after_sales", "allow"),
     ("收到的东西坏了怎么办", "refund_after_sales", "allow"),
     ("运费应该由谁来承担", "refund_after_sales", "allow"),
+    ("我想申请退款，通常需要准备哪些材料", "refund_after_sales", "allow"),
+    ("商品与描述不符，我想退货退款，应该怎么申请", "refund_after_sales", "allow"),
+    ("物流显示已签收，但我没有收到货，应该怎么申请售后", "refund_after_sales", "allow"),
+    ("包裹在运输途中多天没有更新，退款或补发该怎么处理", "refund_after_sales", "allow"),
     # unrelated 探针 -> 生产应拦截
     ("公司代码审核怎么做", "unrelated", "block"),
     ("工伤赔付规则是什么", "unrelated", "block"),
     ("招聘纠纷如何处理", "unrelated", "block"),
     ("你是什么模型", "unrelated", "block"),
+    ("明天北京会下雨吗", "unrelated", "block"),
+    ("Python 如何把 CSV 文件读取成字典列表", "unrelated", "block"),
+    ("请帮我写一份后端工程师招聘 JD", "unrelated", "block"),
+    ("今天心情不错，陪我闲聊几句吧", "unrelated", "block"),
     # uncertain 探针 -> 生产应拦截
     ("东西好像有点问题，你看着办吧", "uncertain", "block"),
     ("帮我处理一下这个订单呗", "uncertain", "block"),
+    ("这个要怎么处理", "uncertain", "block"),
+    ("帮我看看这个订单", "uncertain", "block"),
 ]
 
 ALLOWED_SENTINEL = "ready_for_grounding"

@@ -124,6 +124,7 @@ Mock 替换）；online / heavy 验收默认跳过（即基线中的 2 skipped�
 - [docs/MAIN_FLOW.md](docs/MAIN_FLOW.md)：主流程地图——完整架构、接口契约、
   证据包状态机与限制细节。
 - [docs/TEST_REPORT.md](docs/TEST_REPORT.md)：本轮已确认的演示与测试事实。
+- [docs/INTENT_EVAL_REPORT.md](docs/INTENT_EVAL_REPORT.md)：真实 DeepSeek 意图评测单次结果 20/20 通过（accuracy 100.0%），不代表真实生产分布或总体准确率。
 
 
 ## Roadmap（仅计划，均未实现）
