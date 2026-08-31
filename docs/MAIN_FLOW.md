@@ -369,7 +369,10 @@ blocked_evidence_gate_config_error     Evidence Gate 配置非法
    整条入库链。
 5. **Embedded Qdrant**：`QdrantClient(path="output/qdrant_storage")` 使用
    本地嵌入式模式（开发/演示定位），未部署独立 Qdrant 服务；每请求新建并
-   关闭客户端是已知边界（有意保留），也未针对多实例部署做验证。
+   关闭客户端是已知边界（有意保留）。P0-CONC-MIN 实测支持两次顺序打开、
+   读取、关闭；两个线程或两个进程分别创建客户端并重叠打开同一路径时，一方会以
+   `RuntimeError` 失败。当前每请求新建客户端的实现不支持重叠请求；多进程/多
+   Worker 不可用；共享单客户端的线程并发未测试。
 6. **/ready 不探活**：只做本地静态检查，不验证 DeepSeek 可达、不实例化
    Qdrant 客户端，`ready` 不等于一次真实问答一定能成功。
 7. **进程内缓存的作用域**：Embedding / Reranker 缓存按进程隔离，多进程
