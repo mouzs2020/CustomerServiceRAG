@@ -23,14 +23,21 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from customer_service_rag.agent_router import AgentRoute, route_agent
+from customer_service_rag.agent_orchestrator import (
+    AgentAnswerResponse,
+    run_agent_orchestrator,
+)
 from customer_service_rag.orchestrator import run_answer_pipeline
 from customer_service_rag.readiness import check_readiness
 from customer_service_rag.schemas import (
     AnswerRequest,
     AnswerResponse,
+    AgentAnswerRequest,
     ApiErrorCode,
     ApiErrorResponse,
     HealthResponse,
+    Platform,
     ReadinessResponse,
 )
 
@@ -46,6 +53,7 @@ logger.propagate = False
 
 # 管线执行器：接受 AnswerRequest 与 request_id_factory，返回 AnswerResponse。
 PipelineRunner = Callable[..., AnswerResponse]
+AgentRouter = Callable[[str, Platform | None], AgentRoute]
 
 app = FastAPI(
     title="Customer Service RAG API",
@@ -90,6 +98,16 @@ def get_readiness_checker() -> Callable[..., ReadinessResponse]:
     """依赖注入：默认返回 check_readiness；测试可用
     ``app.dependency_overrides`` 替换。"""
     return check_readiness
+
+
+def get_agent_router() -> AgentRouter:
+    """依赖注入：默认返回 Agent DeepSeek 路由器；测试可替换。"""
+    return route_agent
+
+
+def get_agent_pipeline_runner() -> PipelineRunner:
+    """依赖注入：默认返回既有 RAG pipeline；测试可替换。"""
+    return run_answer_pipeline
 
 
 @app.middleware("http")
@@ -186,6 +204,48 @@ def answer_question(
 
     try:
         return runner(payload, request_id_factory=lambda: request_id)
+    except (RuntimeError, httpx.RequestError):
+        return _error_response(
+            request_id, ApiErrorCode.SERVICE_UNAVAILABLE,
+            SERVICE_UNAVAILABLE_REASON, status_code=503,
+        )
+    except ValueError:
+        return _error_response(
+            request_id, ApiErrorCode.INVALID_UPSTREAM_RESPONSE,
+            INVALID_UPSTREAM_REASON, status_code=502,
+        )
+
+
+@app.post(
+    "/v1/agent/answer",
+    response_model=AgentAnswerResponse,
+    responses={
+        502: {
+            "model": ApiErrorResponse,
+            "description": "上游返回无效结果（invalid_upstream_response）",
+        },
+        503: {
+            "model": ApiErrorResponse,
+            "description": "上游服务不可用（service_unavailable）",
+        },
+    },
+)
+def agent_answer_question(
+    request: Request,
+    payload: AgentAnswerRequest,
+    router: AgentRouter = Depends(get_agent_router),
+    runner: PipelineRunner = Depends(get_agent_pipeline_runner),
+) -> AgentAnswerResponse | JSONResponse:
+    """Bounded agent endpoint; the existing /v1/answer path is unchanged."""
+    request_id = request.state.request_id
+
+    try:
+        return run_agent_orchestrator(
+            payload,
+            router=router,
+            pipeline=runner,
+            request_id_factory=lambda: request_id,
+        )
     except (RuntimeError, httpx.RequestError):
         return _error_response(
             request_id, ApiErrorCode.SERVICE_UNAVAILABLE,

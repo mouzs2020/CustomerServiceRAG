@@ -71,6 +71,10 @@ class AnswerRequest(BaseModel):
         return value
 
 
+class AgentAnswerRequest(AnswerRequest):
+    """Agent endpoint request with the same query/platform validation."""
+
+
 class EvidenceItem(BaseModel):
     """证据项：与当前 evidence bundle 的证据字段完全兼容。
 
@@ -152,6 +156,7 @@ class ReadinessResponse(BaseModel):
 
 __all__ = [
     "MAX_QUERY_LENGTH",
+    "AgentAnswerRequest",
     "AnswerRequest",
     "AnswerResponse",
     "ApiErrorCode",
