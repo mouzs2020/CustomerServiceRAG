@@ -20,9 +20,9 @@
   <main class="app-main">
     <form id="ask-form" novalidate>
       <section class="panel">
-        <h2 class="panel-title">进入平台</h2>
-        <p class="panel-hint">请明确选择提问所针对的平台，用于规则检索与证据匹配。</p>
-        <div class="segmented" role="radiogroup" aria-label="进入平台">
+        <h2 class="panel-title">问答模式</h2>
+        <p class="panel-hint">请选择平台，或交给 Agent 自动路由。</p>
+        <div class="segmented" role="radiogroup" aria-label="问答模式">
           <label class="segment">
             <input type="radio" name="entry-platform" value="aliexpress">
             <span class="segment-label">AliExpress</span>
@@ -30,6 +30,10 @@
           <label class="segment">
             <input type="radio" name="entry-platform" value="temu">
             <span class="segment-label">Temu</span>
+          </label>
+          <label class="segment">
+            <input type="radio" name="entry-platform" value="agent" checked>
+            <span class="segment-label">Agent 自动路由</span>
           </label>
         </div>
       </section>
@@ -55,6 +59,22 @@
         <span>正在检索平台规则并生成回答…</span>
       </div>
 
+      <div id="agent-meta-block" class="agent-meta" hidden>
+        <h2 class="panel-title">Agent 路由</h2>
+        <dl class="diag-list">
+          <dt>action</dt>
+          <dd id="agent-action"></dd>
+          <dt>Request ID</dt>
+          <dd id="agent-request-id"></dd>
+          <dt>tool_trace</dt>
+          <dd id="agent-tool-count"></dd>
+        </dl>
+        <div id="agent-trace-block" hidden>
+          <h3 class="sub-title">工具调用</h3>
+          <ol id="agent-trace-list" class="trace-list"></ol>
+        </div>
+      </div>
+
       <div id="answer-block" hidden>
         <h2 class="panel-title">回答</h2>
         <p id="answer-text" class="answer-text"></p>
@@ -62,6 +82,17 @@
           <h3 class="sub-title">引用</h3>
           <div id="used-citations" class="citation-chips"></div>
         </div>
+      </div>
+
+      <div id="agent-compare-block" hidden>
+        <h2 class="panel-title">平台比较结果</h2>
+        <div id="agent-compare-results" class="compare-grid"></div>
+      </div>
+
+      <div id="agent-decision-block" class="notice notice-warning" hidden>
+        <p id="agent-decision-title" class="notice-text"></p>
+        <p id="agent-decision-text" class="answer-text"></p>
+        <p id="agent-tool-note" class="notice-meta"></p>
       </div>
 
       <div id="blocked-block" hidden>
@@ -93,7 +124,7 @@
     </section>
 
     <section id="placeholder-panel" class="panel placeholder-panel">
-      <p class="placeholder-text">选择平台并输入问题后，点击“发送问题”查看基于平台规则的回答与证据。</p>
+      <p class="placeholder-text">选择 AliExpress 或 Temu 进行单平台问答，或选择 Agent 自动路由，再输入问题查看回答与证据。</p>
     </section>
   </main>
 

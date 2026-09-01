@@ -6,6 +6,7 @@
   "use strict";
 
   var ANSWER_TIMEOUT_MS = 180000;
+  var AGENT_ANSWER_TIMEOUT_MS = 360000;
   var READY_TIMEOUT_MS = 10000;
   var MAX_QUERY_LENGTH = 2000;
 
@@ -44,6 +45,12 @@
     resultPanel: $("result-panel"),
     placeholderPanel: $("placeholder-panel"),
     loading: $("loading-indicator"),
+    agentMeta: $("agent-meta-block"),
+    agentAction: $("agent-action"),
+    agentRequestId: $("agent-request-id"),
+    agentToolCount: $("agent-tool-count"),
+    agentTraceBlock: $("agent-trace-block"),
+    agentTraceList: $("agent-trace-list"),
     answerBlock: $("answer-block"),
     answerText: $("answer-text"),
     citationsBlock: $("citations-block"),
@@ -56,10 +63,16 @@
     errorMessage: $("error-message"),
     errorRequestId: $("error-request-id"),
     evidenceBlock: $("evidence-block"),
-    evidenceList: $("evidence-list")
+    evidenceList: $("evidence-list"),
+    agentCompareBlock: $("agent-compare-block"),
+    agentCompareResults: $("agent-compare-results"),
+    agentDecisionBlock: $("agent-decision-block"),
+    agentDecisionTitle: $("agent-decision-title"),
+    agentDecisionText: $("agent-decision-text"),
+    agentToolNote: $("agent-tool-note")
   };
 
-  /* 两个进入平台 radio：loading 期间统一禁用/恢复。 */
+  /* 三个问答模式 radio：loading 期间统一禁用/恢复。 */
   els.platformRadios = Array.prototype.slice.call(
     document.querySelectorAll('input[name="entry-platform"]')
   );
@@ -76,7 +89,16 @@
   }
 
   function hideAll() {
-    [els.loading, els.answerBlock, els.blockedBlock, els.errorBlock, els.evidenceBlock]
+    [
+      els.loading,
+      els.agentMeta,
+      els.answerBlock,
+      els.blockedBlock,
+      els.errorBlock,
+      els.evidenceBlock,
+      els.agentCompareBlock,
+      els.agentDecisionBlock
+    ]
       .forEach(function (el) { el.hidden = true; });
   }
 
@@ -112,6 +134,12 @@
   function selectedPlatform() {
     var checked = els.form.querySelector('input[name="entry-platform"]:checked');
     return checked ? checked.value : null;
+  }
+
+  function platformLabel(value) {
+    if (value === "aliexpress") { return "AliExpress"; }
+    if (value === "temu") { return "Temu"; }
+    return value;
   }
 
   /* 发送按钮统一判断：非 loading + 服务就绪 + 输入合法，三者缺一不可。 */
@@ -177,8 +205,9 @@
 
   /* ---------- 证据 / 引用渲染 ---------- */
 
-  function renderEvidence(evidence) {
-    els.evidenceList.textContent = "";
+  function renderEvidence(evidence, target) {
+    var list = target || els.evidenceList;
+    list.textContent = "";
     (evidence || []).forEach(function (item) {
       var li = document.createElement("li");
       li.className = "evidence-item";
@@ -218,7 +247,7 @@
       li.appendChild(head);
       li.appendChild(quote);
       li.appendChild(scores);
-      els.evidenceList.appendChild(li);
+      list.appendChild(li);
     });
   }
 
@@ -236,9 +265,7 @@
 
   /* ---------- 各类结果渲染 ---------- */
 
-  function renderReady(body) {
-    hideAll();
-    showPanel();
+  function renderAnswerContent(body) {
     els.answerBlock.hidden = false;
     setText(els.answerText, body.answer);
     renderCitations(body.used_citations);
@@ -247,9 +274,13 @@
     if (evidence.length) { renderEvidence(evidence); }
   }
 
-  function renderBlocked(body) {
+  function renderReady(body) {
     hideAll();
     showPanel();
+    renderAnswerContent(body);
+  }
+
+  function renderBlockedContent(body) {
     els.blockedBlock.hidden = false;
     var message = (body.answer !== null && body.answer !== undefined && body.answer !== "")
       ? body.answer
@@ -257,6 +288,170 @@
     setText(els.blockedMessage, message);
     setText(els.blockedStatus, body.status);
     setText(els.blockedReason, body.reason);
+  }
+
+  function renderBlocked(body) {
+    hideAll();
+    showPanel();
+    renderBlockedContent(body);
+  }
+
+  function buildCitationSection(usedCitations) {
+    var section = document.createElement("section");
+    section.className = "citation-section";
+
+    var title = document.createElement("h4");
+    title.className = "sub-title";
+    title.textContent = "引用";
+    section.appendChild(title);
+
+    var chips = document.createElement("div");
+    chips.className = "citation-chips";
+    var citations = Array.isArray(usedCitations) ? usedCitations : [];
+    if (citations.length === 0) {
+      var empty = document.createElement("span");
+      empty.className = "citation-empty";
+      empty.textContent = "-";
+      chips.appendChild(empty);
+    } else {
+      citations.forEach(function (citationId) {
+        var chip = document.createElement("span");
+        chip.className = "citation-chip";
+        setText(chip, citationId);
+        chips.appendChild(chip);
+      });
+    }
+    section.appendChild(chips);
+    return section;
+  }
+
+  function buildEvidenceDetails(evidence) {
+    var details = document.createElement("details");
+    details.className = "diagnostics evidence-details";
+
+    var summary = document.createElement("summary");
+    summary.textContent = "证据（" + evidence.length + "）";
+    details.appendChild(summary);
+
+    var list = document.createElement("ol");
+    list.className = "evidence-list";
+    renderEvidence(evidence, list);
+    details.appendChild(list);
+    return details;
+  }
+
+  function renderAgentMeta(body, requestId) {
+    els.agentMeta.hidden = false;
+    setText(els.agentAction, body.action);
+    setText(els.agentRequestId, requestId);
+
+    var trace = Array.isArray(body.tool_trace) ? body.tool_trace : [];
+    setText(els.agentToolCount, trace.length);
+    els.agentTraceList.textContent = "";
+    els.agentTraceBlock.hidden = trace.length === 0;
+    trace.forEach(function (item) {
+      var li = document.createElement("li");
+      li.className = "trace-item";
+      var line = document.createElement("span");
+      line.className = "trace-line";
+      setText(
+        line,
+        "step " + item.step + " · " + item.tool + " · " +
+          item.platform + " · " + item.status
+      );
+      li.appendChild(line);
+      els.agentTraceList.appendChild(li);
+    });
+  }
+
+  function renderAgentCompare(body) {
+    els.agentCompareBlock.hidden = false;
+    els.agentCompareResults.textContent = "";
+    var answers = Array.isArray(body.answers) ? body.answers : [];
+    var trace = Array.isArray(body.tool_trace) ? body.tool_trace : [];
+
+    answers.forEach(function (answer, index) {
+      var card = document.createElement("article");
+      card.className = "compare-card";
+
+      var title = document.createElement("h3");
+      title.className = "compare-card-title";
+      var traceItem = trace[index] || {};
+      setText(
+        title,
+        platformLabel(traceItem.platform || (index === 0 ? "aliexpress" : "temu"))
+      );
+      card.appendChild(title);
+
+      var diagnostics = document.createElement("dl");
+      diagnostics.className = "diag-list";
+      var statusLabel = document.createElement("dt");
+      statusLabel.textContent = "status";
+      var statusValue = document.createElement("dd");
+      setText(statusValue, answer && answer.status);
+      diagnostics.appendChild(statusLabel);
+      diagnostics.appendChild(statusValue);
+      var reasonLabel = document.createElement("dt");
+      reasonLabel.textContent = "reason";
+      var reasonValue = document.createElement("dd");
+      setText(reasonValue, answer && answer.reason);
+      diagnostics.appendChild(reasonLabel);
+      diagnostics.appendChild(reasonValue);
+      card.appendChild(diagnostics);
+
+      var answerTitle = document.createElement("h4");
+      answerTitle.className = "sub-title";
+      answerTitle.textContent = "回答";
+      card.appendChild(answerTitle);
+      var answerText = document.createElement("p");
+      answerText.className = "answer-text";
+      setText(answerText, answer && answer.answer);
+      card.appendChild(answerText);
+      card.appendChild(buildCitationSection(answer && answer.used_citations));
+
+      var evidence = answer && Array.isArray(answer.evidence) ? answer.evidence : [];
+      if (evidence.length) {
+        card.appendChild(buildEvidenceDetails(evidence));
+      }
+      els.agentCompareResults.appendChild(card);
+    });
+  }
+
+  function renderAgentDecision(body) {
+    els.agentDecisionBlock.hidden = false;
+    if (body.action === "clarify") {
+      setText(els.agentDecisionTitle, "需要补充信息");
+      setText(els.agentDecisionText, body.clarification);
+    } else {
+      setText(els.agentDecisionTitle, "问题已拦截");
+      setText(els.agentDecisionText, body.reason);
+    }
+    setText(els.agentToolNote, "未调用 RAG 工具");
+  }
+
+  function renderAgent(body, response) {
+    hideAll();
+    showPanel();
+    var data = body || {};
+    renderAgentMeta(data, data.request_id || requestIdOf(response));
+
+    if (data.action === "single_platform") {
+      var answer = data.answer || {};
+      if (answer.status === "ready_for_grounding") {
+        renderAnswerContent(answer);
+      } else {
+        renderBlockedContent(answer);
+      }
+    } else if (data.action === "compare_platforms") {
+      renderAgentCompare(data);
+    } else if (data.action === "clarify" || data.action === "reject") {
+      renderAgentDecision(data);
+    } else {
+      renderAgentDecision({
+        action: "reject",
+        reason: "Agent 返回了无法识别的路由结果。"
+      });
+    }
   }
 
   function renderError(message, requestId) {
@@ -272,32 +467,38 @@
   function submitQuestion() {
     if (loading) { return; }
 
-    var platform = selectedPlatform();
+    var mode = selectedPlatform();
     var query = els.question.value.trim();
 
-    if (!platform || !query) {
-      els.inputHint.textContent = !platform
-        ? "请先选择平台（AliExpress 或 Temu）。"
+    if (!mode || !query) {
+      els.inputHint.textContent = !mode
+        ? "请先选择平台或 Agent 自动路由。"
         : "请输入问题内容。";
       els.inputHint.hidden = false;
       return;
     }
 
+    var isAgent = mode === "agent";
+    var requestBody = isAgent
+      ? { query: query }
+      : { query: query, entry_platform: mode };
     setLoadingState(true);
     showLoading();
 
     fetchWithTimeout(
-      "/v1/answer",
+      isAgent ? "/v1/agent/answer" : "/v1/answer",
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: query, entry_platform: platform })
+        body: JSON.stringify(requestBody)
       },
-      ANSWER_TIMEOUT_MS
+      isAgent ? AGENT_ANSWER_TIMEOUT_MS : ANSWER_TIMEOUT_MS
     ).then(function (response) {
       if (response.status === 200) {
         return response.json().then(function (body) {
-          if (body && body.status === "ready_for_grounding") {
+          if (isAgent) {
+            renderAgent(body, response);
+          } else if (body && body.status === "ready_for_grounding") {
             renderReady(body);
           } else {
             renderBlocked(body || {});

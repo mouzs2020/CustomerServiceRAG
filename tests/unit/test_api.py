@@ -551,8 +551,10 @@ class StaticPageTests(unittest.TestCase):
         self.assertIn('name="entry-platform"', html)
         self.assertIn('value="aliexpress"', html)
         self.assertIn('value="temu"', html)
+        self.assertIn('value="agent"', html)
         self.assertIn("AliExpress", html)
         self.assertIn("Temu", html)
+        self.assertIn("Agent 自动路由", html)
         # 问题输入与发送控件
         self.assertIn('id="question-input"', html)
         self.assertIn('id="send-button"', html)
@@ -573,6 +575,7 @@ class StaticPageTests(unittest.TestCase):
         self.assertIn(".send-button", css)
         js = self.get("/static/app.js").text
         self.assertIn("/v1/answer", js)
+        self.assertIn("/v1/agent/answer", js)
         self.assertIn("entry_platform", js)
 
     def test_static_page_access_does_not_trigger_rag_or_readiness(self):
@@ -630,6 +633,12 @@ class StaticPageTests(unittest.TestCase):
         match = re.search(r"var ANSWER_TIMEOUT_MS = (\d+);", js)
         self.assertIsNotNone(match)
         self.assertGreaterEqual(int(match.group(1)), 180000)
+
+    def test_agent_answer_timeout_is_360000(self):
+        js = (api.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        match = re.search(r"var AGENT_ANSWER_TIMEOUT_MS = (\d+);", js)
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)), 360000)
 
     def test_status_text_uses_chinese_labels(self):
         js = (api.STATIC_DIR / "app.js").read_text(encoding="utf-8")
